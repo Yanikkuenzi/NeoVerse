@@ -6,12 +6,13 @@ from torchvision.transforms import functional as F
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth import save_video
 from diffsynth.utils.auxiliary import CameraTrajectory, load_video, homo_matrix_inverse
+from PIL import Image
 
 
 @torch.no_grad()
 def generate_video(pipe, input_video, prompt, negative_prompt, cam_traj: CameraTrajectory,
                    output_path="outputs/output.mp4", alpha_threshold=1.0, static_flag=False,
-                   seed=42, cfg_scale=1.0, num_inference_steps=4):
+                   seed=42, cfg_scale=1.0, num_inference_steps=4, skip_diffusion=False):
     device = pipe.device
     height, width = input_video[0].size[1], input_video[0].size[0]
     views = {
@@ -75,6 +76,17 @@ def generate_video(pipe, input_video, prompt, negative_prompt, cam_traj: CameraT
         "target_poses": target_cam2world.unsqueeze(0),
         "target_intrs": K_zoomed.unsqueeze(0),
     }
+    if skip_diffusion:
+        # Bypass the diffusion denoiser and save reconstructor renderings directly.
+        # `target_rgb` is expected in float [0,1], shape (batch, frames, H, W, 3).
+        trgb = target_rgb.detach().cpu().numpy()
+        trgb = np.clip(trgb, 0.0, 1.0)
+        frames = []
+        for f in trgb[0]:
+            img = (f * 255).astype(np.uint8)
+            frames.append(Image.fromarray(img))
+        save_video(frames, output_path, fps=16)
+        return
     generated_frames = pipe(
         prompt=prompt,
         negative_prompt=negative_prompt,
@@ -156,6 +168,8 @@ def parse_args():
                         help="Save intermediate rendering visualizations")
     parser.add_argument("--low_vram", action="store_true",
                         help="Enable low-VRAM mode with model offloading (reduces peak VRAM usage)")
+    parser.add_argument("--skip_diffusion", action="store_true",
+                        help="Bypass the diffusion model and save reconstructor renderings directly")
 
     return parser.parse_args()
 
@@ -257,6 +271,7 @@ def main():
         seed=args.seed,
         cfg_scale=cfg_scale,
         num_inference_steps=num_inference_steps,
+        skip_diffusion=args.skip_diffusion,
     )
     print(f"Done! Output saved to: {output_path}")
     return 0

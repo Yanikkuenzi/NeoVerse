@@ -12,10 +12,8 @@ from PIL import Image
 from tqdm import tqdm
 from typing import Optional
 from gsplat.rendering import rasterization
-from gsplat.cuda._torch_impl import (
-    _fully_fused_projection,
-    _quat_scale_to_covar_preci,
-)
+from gsplat.cuda._torch_impl import _fully_fused_projection
+from gsplat.cuda._wrapper import quat_scale_to_covar_preci
 
 
 from ..utils import BasePipeline, ModelConfig, PipelineUnit, PipelineUnitRunner
@@ -629,7 +627,7 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
                     continue
 
                 # Project Gaussians to novel views
-                covars, _ = _quat_scale_to_covar_preci(
+                covars, _ = quat_scale_to_covar_preci(
                     cur_gaussian.rotations,
                     cur_gaussian.scales,
                     True,
