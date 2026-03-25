@@ -2,17 +2,19 @@ import torch
 import os
 import argparse
 import numpy as np
+from PIL import Image
 from torchvision.transforms import functional as F
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth import save_video
-from diffsynth.utils.auxiliary import CameraTrajectory, load_video, homo_matrix_inverse
+from diffsynth.utils.auxiliary import CameraTrajectory, load_video, center_crop, homo_matrix_inverse
 from PIL import Image
 
 
 @torch.no_grad()
 def generate_video(pipe, input_video, prompt, negative_prompt, cam_traj: CameraTrajectory,
                    output_path="outputs/output.mp4", alpha_threshold=1.0, static_flag=False,
-                   seed=42, cfg_scale=1.0, num_inference_steps=4, skip_diffusion=False):
+                   seed=42, cfg_scale=1.0, num_inference_steps=4, skip_diffusion=False,
+                   evaluate=False, evaluate_output_path=None, evaluate_target_names=None):
     device = pipe.device
     height, width = input_video[0].size[1], input_video[0].size[0]
     views = {
@@ -22,6 +24,9 @@ def generate_video(pipe, input_video, prompt, negative_prompt, cam_traj: CameraT
     if static_flag:
         views["is_static"] = torch.ones((1, len(input_video)), dtype=torch.bool, device=device)
         views["timestamp"] = torch.zeros((1, len(input_video)), dtype=torch.int64, device=device)
+    elif evaluate:
+        views["is_static"] = torch.zeros((1, len(input_video)), dtype=torch.bool, device=device)
+        views["timestamp"] = torch.arange(0, 2 * len(input_video), 2, dtype=torch.int64, device=device).unsqueeze(0)
     else:
         views["is_static"] = torch.zeros((1, len(input_video)), dtype=torch.bool, device=device)
         views["timestamp"] = torch.arange(0, len(input_video), dtype=torch.int64, device=device).unsqueeze(0)
@@ -42,6 +47,27 @@ def generate_video(pipe, input_video, prompt, negative_prompt, cam_traj: CameraT
     K = predictions["rendered_intrinsics"][0]
     input_cam2world = predictions["rendered_extrinsics"][0]
     timestamps = predictions["rendered_timestamps"][0]
+
+    if evaluate:
+        num_targets = len(input_video) - 1
+        eval_timestamps = torch.arange(1, 2 * len(input_video) - 1, 2, dtype=torch.int64, device=device)
+        eval_c2w = input_cam2world[0:1].repeat(num_targets, 1, 1)
+        eval_w2c = homo_matrix_inverse(eval_c2w)
+        eval_K = K[:num_targets]
+
+        eval_rgb, _, _ = pipe.reconstructor.gs_renderer.rasterizer.forward(
+            gaussians,
+            render_viewmats=[eval_w2c],
+            render_Ks=[eval_K],
+            render_timestamps=[eval_timestamps],
+            sh_degree=0, width=width, height=height,
+        )
+
+        os.makedirs(evaluate_output_path, exist_ok=True)
+        for i, name in enumerate(evaluate_target_names):
+            frame = (eval_rgb[0, i].clamp(0, 1) * 255).byte().cpu().numpy()
+            Image.fromarray(frame).save(os.path.join(evaluate_output_path, name))
+        print(f"Saved {len(evaluate_target_names)} evaluation frames to {evaluate_output_path}")
 
     if static_flag:
         K = K[:1].repeat(len(cam_traj), 1, 1)
@@ -171,6 +197,12 @@ def parse_args():
     parser.add_argument("--skip_diffusion", action="store_true",
                         help="Bypass the diffusion model and save reconstructor renderings directly")
 
+    # Evaluation
+    parser.add_argument("--evaluate", action="store_true",
+                        help="Evaluate frame interpolation: feed even frames, render odd-timestep frames via Gaussian splatting")
+    parser.add_argument("--evaluate_output_path", default="outputs/evaluate",
+                        help="Directory to save evaluation frames (default: outputs/evaluate)")
+
     return parser.parse_args()
 
 
@@ -243,10 +275,28 @@ def main():
 
     # Load video
     print(f"Loading video from {args.input_path}...")
-    images = load_video(args.input_path, args.num_frames,
-                        resolution=(args.width, args.height),
-                        resize_mode=args.resize_mode,
-                        static_scene=args.static_scene)
+    evaluate_target_names = None
+    if args.evaluate:
+        if not os.path.isdir(args.input_path):
+            print("Error: --evaluate requires --input_path to be a directory of images")
+            return 1
+        all_names = sorted(os.listdir(args.input_path))
+        all_names = [n for n in all_names if n.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        selected = all_names[:2 * args.num_frames]
+        if len(selected) < 2 * args.num_frames:
+            print(f"Warning: found {len(selected)} images, need {2 * args.num_frames} for evaluation")
+        context_paths = [os.path.join(args.input_path, selected[i]) for i in range(0, len(selected), 2)]
+        evaluate_target_names = [selected[i] for i in range(1, len(selected), 2)]
+        resolution = (args.width, args.height)
+        if args.resize_mode == "resize":
+            images = [Image.open(p).convert("RGB").resize(resolution, resample=Image.LANCZOS) for p in context_paths]
+        else:
+            images = [center_crop(Image.open(p).convert("RGB"), resolution) for p in context_paths]
+    else:
+        images = load_video(args.input_path, args.num_frames,
+                            resolution=(args.width, args.height),
+                            resize_mode=args.resize_mode,
+                            static_scene=args.static_scene)
 
     # Run inference
     output_path = args.output_path
@@ -272,6 +322,9 @@ def main():
         cfg_scale=cfg_scale,
         num_inference_steps=num_inference_steps,
         skip_diffusion=args.skip_diffusion,
+        evaluate=args.evaluate,
+        evaluate_output_path=args.evaluate_output_path,
+        evaluate_target_names=evaluate_target_names,
     )
     print(f"Done! Output saved to: {output_path}")
     return 0
