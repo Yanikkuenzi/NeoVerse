@@ -36,7 +36,7 @@ def generate_video(pipe, input_video, prompt, negative_prompt, cam_traj: CameraT
         pipe.reconstructor.to(device)
 
     with torch.amp.autocast("cuda", dtype=pipe.torch_dtype):
-        predictions = pipe.reconstructor(views, is_inference=True, use_motion=False)
+        predictions = pipe.reconstructor(views, is_inference=True, use_motion=evaluate)
 
     # Low-VRAM: offload reconstructor back to CPU
     if pipe.vram_management_enabled:
