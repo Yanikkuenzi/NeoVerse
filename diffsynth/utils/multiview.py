@@ -1,12 +1,61 @@
 import json
-import os
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import Tensor
+from scipy.spatial.transform import Rotation
 
 from diffsynth.auxiliary_models.worldmirror.models.models.rasterization import Gaussians
 from diffsynth.auxiliary_models.worldmirror.models.utils.rotation import quat_to_rotmat, rotmat_to_quat
+
+
+def get_camera_extrinsics(base_path: Path, camera_name: str) -> tuple[Tensor, Tensor]:
+    """Read models.json and return (c2w, K) for the named camera.
+
+    Args:
+        base_path: Directory containing models.json and camera subdirs.
+        camera_name: Camera name matching the 'name' field in models.json.
+
+    Returns:
+        c2w: [4, 4] camera-to-world matrix (float32).
+        K:   [3, 3] intrinsic matrix in pixel units (float32).
+    """
+    with open(base_path / "models.json") as f:
+        views = json.load(f)
+
+    view = None
+    for v in views:
+        if v["name"] == camera_name:
+            view = v
+            break
+    assert view is not None, f"Camera {camera_name} not found in models.json"
+
+    # Build w2c (same convention as AnySplat)
+    R = torch.from_numpy(
+        Rotation.from_rotvec(view["orientation"]).as_matrix()
+    ).to(torch.float32)
+    t = torch.tensor(view["position"], dtype=torch.float32)[:, None]
+
+    w2c = torch.eye(4, dtype=torch.float32)
+    w2c[:3, :3] = R
+    w2c[:3, 3:] = -R @ t
+
+    # Invert to get c2w
+    R_inv = R.T
+    t_inv = -R_inv @ (-R @ t)  # = t
+    c2w = torch.eye(4, dtype=torch.float32)
+    c2w[:3, :3] = R_inv
+    c2w[:3, 3:] = t_inv
+
+    # Intrinsic matrix (pixel units)
+    K = torch.tensor([
+        [view["focal_length"], 0.0, view["principal_point"][0]],
+        [0.0, view["focal_length"], view["principal_point"][1]],
+        [0.0, 0.0, 1.0],
+    ], dtype=torch.float32)
+
+    return c2w, K
 
 
 def transform_gaussians_to_world(gaussians: Gaussians, gt_c2w: Tensor) -> Gaussians:
@@ -49,51 +98,6 @@ def transform_gaussians_to_world(gaussians: Gaussians, gt_c2w: Tensor) -> Gaussi
         timestamp=gaussians.timestamp,
         life_span=gaussians.life_span,
     )
-
-
-def load_multiview_config(path: str) -> dict:
-    """Load and validate a multi-view JSON config file.
-
-    Expected format:
-    {
-      "views": [
-        {
-          "image_dir": "path/to/frames/",
-          "c2w": [[4x4 matrix]]
-        }, ...
-      ],
-      "render_viewpoint": {
-        "c2w": [[4x4 matrix]],
-        "intrinsics": [[3x3 matrix]]
-      }
-    }
-    """
-    with open(path, 'r') as f:
-        config = json.load(f)
-
-    if "views" not in config or not config["views"]:
-        raise ValueError("Config must contain a non-empty 'views' list.")
-    if "render_viewpoint" not in config:
-        raise ValueError("Config must contain 'render_viewpoint'.")
-
-    for i, view in enumerate(config["views"]):
-        if "image_dir" not in view:
-            raise ValueError(f"View {i} must contain 'image_dir'.")
-        if "c2w" not in view:
-            raise ValueError(f"View {i} must contain 'c2w'.")
-        c2w = view["c2w"]
-        if len(c2w) != 4 or any(len(row) != 4 for row in c2w):
-            raise ValueError(f"View {i} 'c2w' must be a 4x4 matrix.")
-
-    rv = config["render_viewpoint"]
-    if "c2w" not in rv:
-        raise ValueError("render_viewpoint must contain 'c2w'.")
-    if "intrinsics" not in rv:
-        raise ValueError("render_viewpoint must contain 'intrinsics'.")
-    if len(rv["intrinsics"]) != 3 or any(len(row) != 3 for row in rv["intrinsics"]):
-        raise ValueError("render_viewpoint 'intrinsics' must be a 3x3 matrix.")
-
-    return config
 
 
 def load_frames_from_dir(image_dir: str) -> list[str]:
