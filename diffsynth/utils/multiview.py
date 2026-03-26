@@ -88,6 +88,10 @@ def transform_gaussians_to_world(gaussians: Gaussians, gt_c2w: Tensor) -> Gaussi
     # Convert xyzw -> wxyz
     quats_world_wxyz = quats_world_xyzw[:, [3, 0, 1, 2]]
 
+    # Rotate velocity vectors to world frame
+    fwd_vel = gaussians.forward_vel @ R_gt.T if gaussians.forward_vel is not None else None
+    bwd_vel = gaussians.backward_vel @ R_gt.T if gaussians.backward_vel is not None else None
+
     return Gaussians(
         means=means_world,
         harmonics=gaussians.harmonics,
@@ -97,6 +101,15 @@ def transform_gaussians_to_world(gaussians: Gaussians, gt_c2w: Tensor) -> Gaussi
         confidences=getattr(gaussians, 'confidences', None),
         timestamp=gaussians.timestamp,
         life_span=gaussians.life_span,
+        life_span_gamma=getattr(gaussians, 'life_span_gamma', 0.0),
+        forward_timestamp=gaussians.forward_timestamp,
+        forward_vel=fwd_vel,
+        forward_scales=getattr(gaussians, 'forward_scales', None),
+        forward_rotations=getattr(gaussians, 'forward_rotations', None),
+        backward_timestamp=gaussians.backward_timestamp,
+        backward_vel=bwd_vel,
+        backward_scales=getattr(gaussians, 'backward_scales', None),
+        backward_rotations=getattr(gaussians, 'backward_rotations', None),
     )
 
 
