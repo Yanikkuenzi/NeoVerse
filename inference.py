@@ -7,11 +7,29 @@ from torchvision.transforms import functional as F
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth import save_video
 from diffsynth.utils.auxiliary import CameraTrajectory, load_video, center_crop, homo_matrix_inverse
+from diffsynth.auxiliary_models.worldmirror.utils.render_utils import (
+    slerp_quaternions,
+    rotation_matrix_to_quaternion,
+    quaternion_to_rotation_matrix,
+)
+
+
+def _interpolate_c2w_midpoint(c2w):
+    R0, R1 = c2w[:-1, :3, :3], c2w[1:, :3, :3]
+    t0, t1 = c2w[:-1, :3, 3],  c2w[1:, :3, 3]
+    q0 = rotation_matrix_to_quaternion(R0)
+    q1 = rotation_matrix_to_quaternion(R1)
+    q = slerp_quaternions(q0, q1, 0.5)
+    R = quaternion_to_rotation_matrix(q)
+    out = torch.eye(4, device=c2w.device, dtype=c2w.dtype).expand(R.shape[0], -1, -1).clone()
+    out[:, :3, :3] = R
+    out[:, :3, 3] = 0.5 * (t0 + t1)
+    return out
 
 
 @torch.no_grad()
 def evaluate_batched(pipe, input_path, output_path, height, width,
-                     batch_size, resize_mode):
+                     batch_size, resize_mode, non_static_cameras=False):
     if batch_size % 2 == 0:
         batch_size += 1
     assert batch_size >= 3, "batch_size must be >= 3 (need at least 2 context frames)"
@@ -87,7 +105,10 @@ def evaluate_batched(pipe, input_path, output_path, height, width,
                                        dtype=torch.int64, device=device)
         assert len(eval_timestamps) == num_window_targets
 
-        eval_c2w = c2w[0:1].repeat(num_window_targets, 1, 1)
+        if non_static_cameras:
+            eval_c2w = _interpolate_c2w_midpoint(c2w)
+        else:
+            eval_c2w = c2w[0:1].repeat(num_window_targets, 1, 1)
         eval_w2c = homo_matrix_inverse(eval_c2w)
         eval_K = K[:num_window_targets]
 
@@ -282,6 +303,8 @@ def parse_args():
                         help="Directory to save evaluation frames (default: outputs/evaluate)")
     parser.add_argument("--batch_size", type=int, default=41,
                         help="Max context frames per reconstructor call in evaluate mode, must be odd (default: 41)")
+    parser.add_argument("--non-static-cameras", dest="non_static_cameras", action="store_true",
+                        help="Interpolate predicted c2w between adjacent context frames (eval mode, non-static camera datasets)")
 
     return parser.parse_args()
 
@@ -367,6 +390,7 @@ def main():
             width=args.width,
             batch_size=args.batch_size,
             resize_mode=args.resize_mode,
+            non_static_cameras=args.non_static_cameras,
         )
         print(f"Done! Output saved to: {args.evaluate_output_path}")
         return 0
