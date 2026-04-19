@@ -228,8 +228,8 @@ def parse_args():
         description="NeoVerse Unified Inference",
     )
 
-    # Trajectory specification (mutually exclusive)
-    traj_group = parser.add_mutually_exclusive_group(required=True)
+    # Trajectory specification (mutually exclusive, not required in --evaluate mode)
+    traj_group = parser.add_mutually_exclusive_group(required=False)
     traj_group.add_argument("--trajectory",
                             choices=["pan_left", "pan_right", "tilt_up", "tilt_down",
                                      "move_left", "move_right", "push_in", "pull_out",
@@ -349,19 +349,25 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    # Build trajectory
-    if args.trajectory:
-        cam_traj = CameraTrajectory.from_predefined(
-            args.trajectory,
-            num_frames=args.num_frames,
-            mode=args.traj_mode,
-            angle=args.angle,
-            distance=args.distance,
-            orbit_radius=args.orbit_radius,
-            zoom_ratio=args.zoom_ratio,
-        )
-    else:
-        cam_traj = CameraTrajectory.from_json(args.trajectory_file)
+    # Build trajectory (not needed in --evaluate mode — pose is taken from
+    # context frames and optionally interpolated via --non-static-cameras)
+    cam_traj = None
+    if not args.evaluate:
+        if args.trajectory is None and args.trajectory_file is None:
+            print("Error: --trajectory or --trajectory_file is required for non-evaluate inference")
+            return 1
+        if args.trajectory:
+            cam_traj = CameraTrajectory.from_predefined(
+                args.trajectory,
+                num_frames=args.num_frames,
+                mode=args.traj_mode,
+                angle=args.angle,
+                distance=args.distance,
+                orbit_radius=args.orbit_radius,
+                zoom_ratio=args.zoom_ratio,
+            )
+        else:
+            cam_traj = CameraTrajectory.from_json(args.trajectory_file)
 
     # Load model
     print(f"Loading model from {args.model_path}...")
