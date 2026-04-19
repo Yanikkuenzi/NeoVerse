@@ -300,7 +300,7 @@ def parse_args():
     parser.add_argument("--evaluate", action="store_true",
                         help="Evaluate frame interpolation: feed even frames, render odd-timestep frames via Gaussian splatting")
     parser.add_argument("--evaluate_output_path", default="outputs/evaluate",
-                        help="Directory to save evaluation frames (default: outputs/evaluate)")
+                        help="Directory to save evaluation frames (default: outputs/evalua te)")
     parser.add_argument("--batch_size", type=int, default=41,
                         help="Max context frames per reconstructor call in evaluate mode, must be odd (default: 41)")
     parser.add_argument("--non-static-cameras", dest="non_static_cameras", action="store_true",
