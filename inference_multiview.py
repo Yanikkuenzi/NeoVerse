@@ -9,6 +9,7 @@ from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth.utils.auxiliary import homo_matrix_inverse, center_crop
 from diffsynth.utils.multiview import (
     discover_cameras,
+    estimate_sim3_local_to_gt,
     load_scene_c2w,
     transform_gaussians_to_world,
     load_frames_from_dir,
@@ -112,9 +113,15 @@ def multiview_eval(pipe, cameras, input_path, output_path, height, width,
 
             window_intrinsics[cam_name] = predictions["rendered_intrinsics"][0]  # [W, 3, 3]
 
-            gt_c2w = camera_c2w[cam_name][2 * start]
+            # Reconstructor splats live in a scale-ambiguous local frame
+            # (context-frame 0 ~= identity, arbitrary global scale). Align
+            # them to the GT world via Sim(3) over this window's W context
+            # poses before fusing across cameras.
+            pred_c2w = predictions["rendered_extrinsics"][0]            # [W, 4, 4]
+            gt_c2w_window = camera_c2w[cam_name][2 * start:2 * end:2]   # [W, 4, 4]
+            R, t_vec, s = estimate_sim3_local_to_gt(pred_c2w, gt_c2w_window)
             for gs in predictions["splats"][0]:
-                window_gaussians.append(transform_gaussians_to_world(gs, gt_c2w))
+                window_gaussians.append(transform_gaussians_to_world(gs, R, t_vec, s))
 
         # --- Phase 2: Render from each camera at this window's target timestamps ---
         # Context timestamps: [2*start, 2*start+2, ..., 2*(end-1)]

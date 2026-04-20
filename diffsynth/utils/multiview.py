@@ -9,6 +9,8 @@ from scipy.spatial.transform import Rotation
 
 from diffsynth.auxiliary_models.worldmirror.models.models.rasterization import Gaussians
 from diffsynth.auxiliary_models.worldmirror.models.utils.rotation import quat_to_rotmat, rotmat_to_quat
+from diffsynth.auxiliary_models.depth_anything_3.utils.pose_align import align_poses_umeyama
+from diffsynth.utils.auxiliary import homo_matrix_inverse
 
 
 def _parse_ue5_matrix(matrix_str: str) -> np.ndarray:
@@ -187,56 +189,91 @@ def get_camera_extrinsics(base_path: Path, camera_name: str) -> tuple[Tensor, Te
     return c2w, K
 
 
-def transform_gaussians_to_world(gaussians: Gaussians, gt_c2w: Tensor) -> Gaussians:
-    """Transform Gaussians from camera-local frame to world frame via GT c2w.
+def estimate_sim3_local_to_gt(
+    pred_c2w: Tensor, gt_c2w: Tensor
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Estimate a Sim(3) that maps the reconstructor's local frame to GT world.
+
+    Runs Umeyama alignment on W paired predicted / GT camera poses (camera
+    centers + orientations). The returned transform is defined by
+    ``p_world = s * (R @ p_local) + t`` and is the same Sim(3) applied to
+    Gaussian centers, scales and rotations in ``transform_gaussians_to_world``.
 
     Args:
-        gaussians: Gaussians with parameters in the reconstructor's local
-            coordinate frame (frame 0 at origin).
-        gt_c2w: [4, 4] ground-truth camera-to-world matrix for this view.
+        pred_c2w: [W, 4, 4] predicted camera-to-world from the reconstructor.
+        gt_c2w:   [W, 4, 4] GT camera-to-world for the same context frames.
 
     Returns:
-        New Gaussians with means and rotations transformed to world frame.
+        Tuple ``(R, t, s)`` on ``pred_c2w``'s device/dtype, with shapes
+        ``[3, 3]``, ``[3]``, ``[]``.
     """
-    R_gt = gt_c2w[:3, :3]  # [3, 3]
-    t_gt = gt_c2w[:3, 3]   # [3]
+    assert pred_c2w.shape == gt_c2w.shape and pred_c2w.shape[-2:] == (4, 4), (
+        f"pred_c2w {tuple(pred_c2w.shape)} and gt_c2w {tuple(gt_c2w.shape)} "
+        "must share shape [W, 4, 4]"
+    )
+    assert pred_c2w.shape[0] >= 3, "Umeyama alignment needs at least 3 poses"
 
-    # Transform means: world_pt = R_gt @ local_pt + t_gt
-    means_world = gaussians.means @ R_gt.T + t_gt.unsqueeze(0)
+    pred_w2c_np = homo_matrix_inverse(pred_c2w).detach().cpu().double().numpy()
+    gt_w2c_np = homo_matrix_inverse(gt_c2w).detach().cpu().double().numpy()
 
-    # Transform rotations (wxyz convention in Gaussians)
-    # Convert wxyz -> xyzw for rotation utilities
-    quats_wxyz = gaussians.rotations  # [N, 4]
+    R_np, t_np, s_np = align_poses_umeyama(gt_w2c_np, pred_w2c_np)
+
+    device, dtype = pred_c2w.device, pred_c2w.dtype
+    R = torch.from_numpy(np.ascontiguousarray(R_np)).to(device=device, dtype=dtype)
+    t = torch.from_numpy(np.asarray(t_np, dtype=np.float64).reshape(3)).to(
+        device=device, dtype=dtype
+    )
+    s = torch.tensor(float(s_np), device=device, dtype=dtype)
+    return R, t, s
+
+
+def transform_gaussians_to_world(
+    gaussians: Gaussians, R: Tensor, t: Tensor, s: Tensor
+) -> Gaussians:
+    """Apply a Sim(3) ``(R, t, s)`` to Gaussians living in the reconstructor's
+    scale-ambiguous local frame, producing Gaussians in the target world frame.
+
+    Mapping: ``p_world = s * (R @ p_local) + t``. Rotation composes with each
+    Gaussian's orientation; ``scales`` is multiplied by ``s``; velocities are
+    rotated and rescaled. Photometric / opacity / timestamp fields pass through.
+
+    Args:
+        gaussians: Gaussians in the reconstructor's local frame.
+        R: [3, 3] rotation.
+        t: [3] translation.
+        s: scalar scale (0-d tensor).
+    """
+    means_world = (gaussians.means @ R.T) * s + t.unsqueeze(0)
+
+    scales_world = gaussians.scales * s
+
+    # wxyz -> xyzw, compose with R, back to wxyz
+    quats_wxyz = gaussians.rotations
     quats_xyzw = quats_wxyz[:, [1, 2, 3, 0]]
-
-    # Convert to rotation matrices, compose with GT rotation, convert back
-    R_local = quat_to_rotmat(quats_xyzw)    # [N, 3, 3]
-    R_world = R_gt.unsqueeze(0) @ R_local    # [N, 3, 3]
-    quats_world_xyzw = rotmat_to_quat(R_world)  # [N, 4] xyzw
-
-    # Convert xyzw -> wxyz
+    R_local = quat_to_rotmat(quats_xyzw)
+    R_world = R.unsqueeze(0) @ R_local
+    quats_world_xyzw = rotmat_to_quat(R_world)
     quats_world_wxyz = quats_world_xyzw[:, [3, 0, 1, 2]]
 
-    # Rotate velocity vectors to world frame
-    fwd_vel = gaussians.forward_vel @ R_gt.T if gaussians.forward_vel is not None else None
-    bwd_vel = gaussians.backward_vel @ R_gt.T if gaussians.backward_vel is not None else None
+    def _vel(v):
+        return (v @ R.T) * s if v is not None else None
 
     return Gaussians(
         means=means_world,
         harmonics=gaussians.harmonics,
         opacities=gaussians.opacities,
-        scales=gaussians.scales,
+        scales=scales_world,
         rotations=quats_world_wxyz,
         confidences=getattr(gaussians, 'confidences', None),
         timestamp=gaussians.timestamp,
         life_span=gaussians.life_span,
         life_span_gamma=getattr(gaussians, 'life_span_gamma', 0.0),
         forward_timestamp=gaussians.forward_timestamp,
-        forward_vel=fwd_vel,
+        forward_vel=_vel(gaussians.forward_vel),
         forward_scales=getattr(gaussians, 'forward_scales', None),
         forward_rotations=getattr(gaussians, 'forward_rotations', None),
         backward_timestamp=gaussians.backward_timestamp,
-        backward_vel=bwd_vel,
+        backward_vel=_vel(gaussians.backward_vel),
         backward_scales=getattr(gaussians, 'backward_scales', None),
         backward_rotations=getattr(gaussians, 'backward_rotations', None),
     )
