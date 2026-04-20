@@ -2,17 +2,18 @@
 set -euo pipefail
 
 # ---- Edit these to change a run -----------------------------------------
-SCENES_ROOT="/iopsstor/scratch/cscs/yknzi/anysplat/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f35_aperture2.4"
+# SCENES_ROOT="/iopsstor/scratch/cscs/yknzi/anysplat/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f35_aperture2.4"
+SCENES_ROOT="/iopsstor/scratch/cscs/yknzi/anysplat/kubric-eval"
 OUTPUT_ROOT="outputs/mono"
-HEIGHT=335
-WIDTH=559
-BATCH_SIZE=40
+HEIGHT=336
+WIDTH=560
+BATCH_SIZE=41
 RESIZE_MODE="center_crop"
-NON_STATIC_CAMERAS=0      # 1 = pass --non-static-cameras,  0 = omit
+NON_STATIC_CAMERAS=1      # 1 = pass --non-static-cameras,  0 = omit
 LOW_VRAM=-1                # 1 = pass --low_vram,            0 = omit
 MODEL_PATH="/iopsstor/scratch/cscs/yknzi/anysplat/neoverse-models/"
 RECONSTRUCTOR_PATH="/iopsstor/scratch/cscs/yknzi/anysplat/neoverse-models/NeoVerse/reconstructor.ckpt"
-MAX_SCENES=15
+MAX_SCENES=10
 # -------------------------------------------------------------------------
 
 if [[ ! -d "$SCENES_ROOT" ]]; then
