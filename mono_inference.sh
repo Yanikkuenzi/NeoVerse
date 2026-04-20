@@ -2,16 +2,17 @@
 set -euo pipefail
 
 # ---- Edit these to change a run -----------------------------------------
-SCENES_ROOT="data/scenes"
+SCENES_ROOT="/iopsstor/scratch/cscs/yknzi/anysplat/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f34_aperture2.4"
 OUTPUT_ROOT="outputs/mono"
-HEIGHT=336
-WIDTH=560
-BATCH_SIZE=41
+HEIGHT=335
+WIDTH=559
+BATCH_SIZE=40
 RESIZE_MODE="center_crop"
-NON_STATIC_CAMERAS=1      # 1 = pass --non-static-cameras, 0 = omit
-LOW_VRAM=0                # 1 = pass --low_vram,            0 = omit
-MODEL_PATH="models"
-RECONSTRUCTOR_PATH="models/NeoVerse/reconstructor.ckpt"
+NON_STATIC_CAMERAS=0      # 1 = pass --non-static-cameras,  0 = omit
+LOW_VRAM=-1                # 1 = pass --low_vram,            0 = omit
+MODEL_PATH="/iopsstor/scratch/cscs/yknzi/anysplat/neoverse-models/"
+RECONSTRUCTOR_PATH="/iopsstor/scratch/cscs/yknzi/anysplat/neoverse-models/NeoVerse/reconstructor.ckpt"
+MAX_SCENES=15
 # -------------------------------------------------------------------------
 
 if [[ ! -d "$SCENES_ROOT" ]]; then
@@ -29,7 +30,7 @@ common_args=(
     --reconstructor_path "$RECONSTRUCTOR_PATH"
 )
 (( NON_STATIC_CAMERAS )) && common_args+=(--non-static-cameras)
-(( LOW_VRAM ))            && common_args+=(--low_vram)
+(( LOW_VRAM ))           && common_args+=(--low_vram)
 
 shopt -s nullglob
 for scene_dir in "$SCENES_ROOT"/*/; do

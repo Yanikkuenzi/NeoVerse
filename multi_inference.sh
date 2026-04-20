@@ -2,15 +2,16 @@
 set -euo pipefail
 
 # ---- Edit these to change a run -----------------------------------------
-SCENES_ROOT="data/scenes"
+SCENES_ROOT="/iopsstor/scratch/cscs/yknzi/anysplat/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f35_aperture2.4"
 OUTPUT_ROOT="outputs/multi"
 HEIGHT=336
 WIDTH=560
 BATCH_SIZE=41
 RESIZE_MODE="center_crop"
 LOW_VRAM=0                # 1 = pass --low_vram, 0 = omit
-MODEL_PATH="models"
-RECONSTRUCTOR_PATH="models/NeoVerse/reconstructor.ckpt"
+MODEL_PATH="/iopsstor/scratch/cscs/yknzi/anysplat/neoverse-models/"
+RECONSTRUCTOR_PATH="/iopsstor/scratch/cscs/yknzi/anysplat/neoverse-models/NeoVerse/reconstructor.ckpt"
+MAX_SCENES=15
 # -------------------------------------------------------------------------
 
 if [[ ! -d "$SCENES_ROOT" ]]; then
@@ -28,7 +29,9 @@ common_args=(
 )
 (( LOW_VRAM )) && common_args+=(--low_vram)
 
+
 shopt -s nullglob
+num_scenes=0
 for scene_dir in "$SCENES_ROOT"/*/; do
     scene_name=$(basename "$scene_dir")
     if [[ ! -f "$scene_dir/models.json" && ! -f "$scene_dir/cameras/camera_extrinsics.json" ]]; then
@@ -53,4 +56,8 @@ for scene_dir in "$SCENES_ROOT"/*/; do
         --input_path "$scene_dir" \
         --cameras "${cameras[@]}" \
         --output_path "$out_dir"
+    num_scenes=$((num_scenes + 1))
+    if [ $num_scenes -ge $MAX_SCENES ]; then
+        break;
+    fi
 done
