@@ -8,6 +8,7 @@ from torchvision.transforms import functional as F
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth.utils.auxiliary import homo_matrix_inverse, center_crop
 from diffsynth.utils.multiview import (
+    discover_cameras,
     load_scene_c2w,
     transform_gaussians_to_world,
     load_frames_from_dir,
@@ -164,8 +165,9 @@ def parse_args():
     )
     parser.add_argument("--input_path", type=Path, required=True,
                         help="Base directory with camera_*/ subdirs and models.json")
-    parser.add_argument("--cameras", nargs="+", required=True,
-                        help="Camera names to use (must match names in models.json)")
+    parser.add_argument("--cameras", nargs="*", default=None,
+                        help="Camera folder names to use. If omitted, auto-discovered "
+                             "from models.json or cameras/camera_extrinsics.json.")
     parser.add_argument("--output_path", default="outputs/multiview_eval",
                         help="Output directory for rendered frames (default: outputs/multiview_eval)")
     parser.add_argument("--model_path", default="models",
@@ -208,10 +210,15 @@ def main():
     )
     print("Model loaded!")
 
-    print(f"Running multi-view evaluation with {len(args.cameras)} cameras...")
+    cameras = args.cameras
+    if not cameras:
+        cameras = discover_cameras(args.input_path)
+    assert cameras, f"No cameras found under {args.input_path}"
+
+    print(f"Running multi-view evaluation with {len(cameras)} cameras...")
     multiview_eval(
         pipe=pipe,
-        cameras=args.cameras,
+        cameras=cameras,
         input_path=args.input_path,
         output_path=args.output_path,
         height=args.height,

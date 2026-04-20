@@ -38,23 +38,11 @@ for scene_dir in "$SCENES_ROOT"/*/; do
         echo "[multi] $scene_name: no models.json or cameras/camera_extrinsics.json, skipping"
         continue
     fi
-    cam_dirs=("$scene_dir"*/)
-    cameras=()
-    for cam_dir in "${cam_dirs[@]}"; do
-        cam_name=$(basename "$cam_dir")
-        [[ "$cam_name" == "cameras" ]] && continue
-        cameras+=("$cam_name")
-    done
-    if (( ${#cameras[@]} == 0 )); then
-        echo "[multi] $scene_name: no camera subdirs, skipping"
-        continue
-    fi
     out_dir="$OUTPUT_ROOT/$scene_name"
-    echo "[multi] $scene_name (cameras: ${cameras[*]}) -> $out_dir"
+    echo "[multi] $scene_name -> $out_dir"
     python inference_multiview.py \
         "${common_args[@]}" \
         --input_path "$scene_dir" \
-        --cameras "${cameras[@]}" \
         --output_path "$out_dir"
     num_scenes=$((num_scenes + 1))
     if [ $num_scenes -ge $MAX_SCENES ]; then

@@ -39,6 +39,45 @@ def _folder_to_json_cam(folder_name: str) -> str:
     return f"cam{int(m.group(1)):02d}"
 
 
+def discover_cameras(base_path: Path) -> list[str]:
+    """Discover camera folder names for a scene from its metadata.
+
+    - ``models.json`` -> camera names from the ``name`` field.
+    - ``cameras/camera_extrinsics.json`` -> folder names whose
+      ``_folder_to_json_cam(...)`` matches a key in the JSON.
+    """
+    base_path = Path(base_path)
+    models_path = base_path / "models.json"
+    extrinsics_path = base_path / "cameras" / "camera_extrinsics.json"
+
+    if models_path.exists():
+        with open(models_path) as f:
+            views = json.load(f)
+        return sorted(v["name"] for v in views)
+
+    if extrinsics_path.exists():
+        with open(extrinsics_path) as f:
+            data = json.load(f)
+        first_frame = next(iter(data.values()))
+        json_keys = set(first_frame.keys())
+        cams = []
+        for entry in sorted(base_path.iterdir()):
+            if not entry.is_dir() or entry.name == "cameras":
+                continue
+            try:
+                key = _folder_to_json_cam(entry.name)
+            except ValueError:
+                continue
+            if key in json_keys:
+                cams.append(entry.name)
+        return cams
+
+    raise FileNotFoundError(
+        f"Neither {models_path} nor {extrinsics_path} exists; cannot "
+        f"discover cameras for scene at {base_path}."
+    )
+
+
 def load_scene_c2w(
     base_path: Path,
     camera_folders: list[str],
