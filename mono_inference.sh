@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ---- Edit these to change a run -----------------------------------------
-SCENES_ROOT="/iopsstor/scratch/cscs/yknzi/anysplat/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f34_aperture2.4"
+SCENES_ROOT="/iopsstor/scratch/cscs/yknzi/anysplat/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f35_aperture2.4"
 OUTPUT_ROOT="outputs/mono"
 HEIGHT=335
 WIDTH=559
@@ -35,7 +35,7 @@ common_args=(
 shopt -s nullglob
 for scene_dir in "$SCENES_ROOT"/*/; do
     scene_name=$(basename "$scene_dir")
-    cam_dirs=("$scene_dir"*/)
+    cam_dirs=("$scene_dir"camera_{0001..0004}/)
     if (( ${#cam_dirs[@]} == 0 )); then
         echo "[mono] $scene_name: no camera subdirs, skipping"
         continue
