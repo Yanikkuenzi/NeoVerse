@@ -31,19 +31,21 @@ common_args=(
 shopt -s nullglob
 for scene_dir in "$SCENES_ROOT"/*/; do
     scene_name=$(basename "$scene_dir")
-    if [[ ! -f "$scene_dir/models.json" ]]; then
-        echo "[multi] $scene_name: no models.json, skipping"
+    if [[ ! -f "$scene_dir/models.json" && ! -f "$scene_dir/cameras/camera_extrinsics.json" ]]; then
+        echo "[multi] $scene_name: no models.json or cameras/camera_extrinsics.json, skipping"
         continue
     fi
     cam_dirs=("$scene_dir"*/)
-    if (( ${#cam_dirs[@]} == 0 )); then
+    cameras=()
+    for cam_dir in "${cam_dirs[@]}"; do
+        cam_name=$(basename "$cam_dir")
+        [[ "$cam_name" == "cameras" ]] && continue
+        cameras+=("$cam_name")
+    done
+    if (( ${#cameras[@]} == 0 )); then
         echo "[multi] $scene_name: no camera subdirs, skipping"
         continue
     fi
-    cameras=()
-    for cam_dir in "${cam_dirs[@]}"; do
-        cameras+=("$(basename "$cam_dir")")
-    done
     out_dir="$OUTPUT_ROOT/$scene_name"
     echo "[multi] $scene_name (cameras: ${cameras[*]}) -> $out_dir"
     python inference_multiview.py \

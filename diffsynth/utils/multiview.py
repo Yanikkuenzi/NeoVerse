@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +9,95 @@ from scipy.spatial.transform import Rotation
 
 from diffsynth.auxiliary_models.worldmirror.models.models.rasterization import Gaussians
 from diffsynth.auxiliary_models.worldmirror.models.utils.rotation import quat_to_rotmat, rotmat_to_quat
+
+
+def _parse_ue5_matrix(matrix_str: str) -> np.ndarray:
+    """Parse a MultiCamVideo-style matrix string into a (4, 4) numpy array.
+
+    Ported from ReCamMaster's vis_cam.py. The string looks like
+    ``"[r00 r01 r02 0] [r10 r11 r12 0] [r20 r21 r22 0] [tx ty tz 1]"``.
+    3-element rows are padded with a trailing zero.
+    """
+    rows = matrix_str.strip().split('] [')
+    matrix = []
+    for row in rows:
+        row = row.replace('[', '').replace(']', '')
+        vals = list(map(float, row.split()))
+        if len(vals) == 3:
+            vals.append(0.0)
+        matrix.append(vals)
+    return np.array(matrix, dtype=np.float64)
+
+
+def _folder_to_json_cam(folder_name: str) -> str:
+    """Map a camera folder name like ``camera_0001`` to its JSON key ``cam01``."""
+    m = re.search(r"(\d+)$", folder_name)
+    if m is None:
+        raise ValueError(
+            f"Cannot derive camera index from folder name '{folder_name}'"
+        )
+    return f"cam{int(m.group(1)):02d}"
+
+
+def load_scene_c2w(
+    base_path: Path,
+    camera_folders: list[str],
+    num_frames: int,
+) -> dict[str, Tensor]:
+    """Load per-frame c2w matrices for every camera in the scene.
+
+    Dispatches between the legacy ``models.json`` format (one static c2w per
+    camera) and the MultiCamVideo ``cameras/camera_extrinsics.json`` format
+    (per-frame w2c that is transformed to c2w following ReCamMaster's
+    vis_cam.py).
+
+    Returns a dict mapping each input folder name to a ``[num_frames, 4, 4]``
+    float32 tensor of c2w matrices.
+    """
+    base_path = Path(base_path)
+    models_path = base_path / "models.json"
+    extrinsics_path = base_path / "cameras" / "camera_extrinsics.json"
+
+    if models_path.exists():
+        out: dict[str, Tensor] = {}
+        for cam in camera_folders:
+            c2w, _ = get_camera_extrinsics(base_path, cam)
+            out[cam] = c2w.unsqueeze(0).expand(num_frames, -1, -1).contiguous()
+        return out
+
+    if extrinsics_path.exists():
+        with open(extrinsics_path) as f:
+            data = json.load(f)
+
+        frame_keys = sorted(data.keys(), key=lambda k: int(re.search(r"\d+", k).group()))
+        if len(frame_keys) != num_frames:
+            raise ValueError(
+                f"{extrinsics_path} has {len(frame_keys)} frames but scene has "
+                f"{num_frames} image frames; counts must match."
+            )
+
+        out = {}
+        for cam in camera_folders:
+            json_key = _folder_to_json_cam(cam)
+            mats = np.empty((num_frames, 4, 4), dtype=np.float32)
+            for i, fk in enumerate(frame_keys):
+                if json_key not in data[fk]:
+                    raise KeyError(
+                        f"Camera key '{json_key}' (folder '{cam}') not found in "
+                        f"{extrinsics_path} at '{fk}'"
+                    )
+                m = _parse_ue5_matrix(data[fk][json_key])
+                m = m.T
+                m = m[:, [1, 2, 0, 3]]
+                m[:3, 1] *= -1.0
+                mats[i] = np.linalg.inv(m).astype(np.float32)
+            out[cam] = torch.from_numpy(mats)
+        return out
+
+    raise FileNotFoundError(
+        f"Neither {models_path} nor {extrinsics_path} exists; cannot load "
+        f"camera poses for scene at {base_path}."
+    )
 
 
 def get_camera_extrinsics(base_path: Path, camera_name: str) -> tuple[Tensor, Tensor]:

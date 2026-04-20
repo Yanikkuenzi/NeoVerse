@@ -8,7 +8,7 @@ from torchvision.transforms import functional as F
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth.utils.auxiliary import homo_matrix_inverse, center_crop
 from diffsynth.utils.multiview import (
-    get_camera_extrinsics,
+    load_scene_c2w,
     transform_gaussians_to_world,
     load_frames_from_dir,
 )
@@ -48,15 +48,16 @@ def multiview_eval(pipe, cameras, input_path, output_path, height, width,
         camera_context_paths[cam_name] = [all_paths[i] for i in range(0, len(all_paths), 2)]
         camera_target_names[cam_name] = [Path(all_paths[i]).name for i in range(1, len(all_paths), 2)]
 
+    assert total_frames is not None, "No cameras provided"
     S = len(camera_context_paths[cameras[0]])  # total context frames per camera
     total_targets = S - 1
     print(f"  {total_frames} total frames per camera -> {S} context, {total_targets} targets")
 
-    # Preload GT extrinsics
-    camera_c2w = {}
-    for cam_name in cameras:
-        c2w, _ = get_camera_extrinsics(input_path, cam_name)
-        camera_c2w[cam_name] = c2w.to(device)
+    # Preload GT extrinsics (per-frame c2w; static sources get broadcast to T frames)
+    camera_c2w = {
+        cam: c2w.to(device)
+        for cam, c2w in load_scene_c2w(input_path, list(cameras), total_frames).items()
+    }
 
     # Create output dirs
     for cam_name in cameras:
@@ -110,7 +111,7 @@ def multiview_eval(pipe, cameras, input_path, output_path, height, width,
 
             window_intrinsics[cam_name] = predictions["rendered_intrinsics"][0]  # [W, 3, 3]
 
-            gt_c2w = camera_c2w[cam_name]
+            gt_c2w = camera_c2w[cam_name][2 * start]
             for gs in predictions["splats"][0]:
                 window_gaussians.append(transform_gaussians_to_world(gs, gt_c2w))
 
@@ -121,9 +122,12 @@ def multiview_eval(pipe, cameras, input_path, output_path, height, width,
                                        dtype=torch.int64, device=device)
         assert len(eval_timestamps) == num_window_targets
 
+        # Global frame index of each target: 2*(start + i) + 1
+        target_frame_idx = eval_timestamps
+
         for cam_name in cameras:
-            render_w2c = homo_matrix_inverse(camera_c2w[cam_name].unsqueeze(0))
-            render_w2c = render_w2c.expand(num_window_targets, -1, -1)
+            render_c2w = camera_c2w[cam_name][target_frame_idx]  # [Nt, 4, 4]
+            render_w2c = homo_matrix_inverse(render_c2w)
 
             # Target i sits between context i and i+1; use context i's intrinsics
             render_K = window_intrinsics[cam_name][:num_window_targets]
