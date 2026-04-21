@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ---- Edit these to change a run -----------------------------------------
-SCENES_ROOT="/iopsstor/scratch/cscs/yknzi/anysplat/MultiCamVideo-Dataset/MultiCamVideo-Dataset/train/f35_aperture2.4"
+SCENES_ROOT="/iopsstor/scratch/cscs/yknzi/anysplat/kubric-eval"
 OUTPUT_ROOT="outputs/multi"
 HEIGHT=336
 WIDTH=560
@@ -11,6 +11,7 @@ RESIZE_MODE="center_crop"
 LOW_VRAM=0                # 1 = pass --low_vram, 0 = omit
 MODEL_PATH="/iopsstor/scratch/cscs/yknzi/anysplat/neoverse-models/"
 RECONSTRUCTOR_PATH="/iopsstor/scratch/cscs/yknzi/anysplat/neoverse-models/NeoVerse/reconstructor.ckpt"
+CAMERAS=("camera_0001" "camera_0002" "camera_0003" "camera_0004")
 MAX_SCENES=15
 # -------------------------------------------------------------------------
 
@@ -26,6 +27,7 @@ common_args=(
     --resize_mode "$RESIZE_MODE"
     --model_path "$MODEL_PATH"
     --reconstructor_path "$RECONSTRUCTOR_PATH"
+    --cameras "$CAMERAS"
 )
 (( LOW_VRAM )) && common_args+=(--low_vram)
 

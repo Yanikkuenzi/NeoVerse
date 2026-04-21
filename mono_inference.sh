@@ -10,7 +10,7 @@ WIDTH=560
 BATCH_SIZE=41
 RESIZE_MODE="center_crop"
 NON_STATIC_CAMERAS=1      # 1 = pass --non-static-cameras,  0 = omit
-LOW_VRAM=-1                # 1 = pass --low_vram,            0 = omit
+LOW_VRAM=-1               # 1 = pass --low_vram,            0 = omit
 MODEL_PATH="/iopsstor/scratch/cscs/yknzi/anysplat/neoverse-models/"
 RECONSTRUCTOR_PATH="/iopsstor/scratch/cscs/yknzi/anysplat/neoverse-models/NeoVerse/reconstructor.ckpt"
 MAX_SCENES=10
@@ -34,6 +34,7 @@ common_args=(
 (( LOW_VRAM ))           && common_args+=(--low_vram)
 
 shopt -s nullglob
+num_scenes=0
 for scene_dir in "$SCENES_ROOT"/*/; do
     scene_name=$(basename "$scene_dir")
     cam_dirs=("$scene_dir"camera_{0001..0004}/)
@@ -50,4 +51,8 @@ for scene_dir in "$SCENES_ROOT"/*/; do
             --input_path "$cam_dir" \
             --evaluate_output_path "$out_dir"
     done
+    num_scenes=$((num_scenes + 1))
+    if [ $num_scenes -ge $MAX_SCENES ]; then
+        break;
+    fi
 done
