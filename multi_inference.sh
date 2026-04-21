@@ -34,8 +34,18 @@ shopt -s nullglob
 num_scenes=0
 for scene_dir in "$SCENES_ROOT"/*/; do
     scene_name=$(basename "$scene_dir")
-    if [[ ! -f "$scene_dir/models.json" && ! -f "$scene_dir/cameras/camera_extrinsics.json" ]]; then
-        echo "[multi] $scene_name: no models.json or cameras/camera_extrinsics.json, skipping"
+    has_kubric=0
+    for json_path in "$scene_dir"*.json; do
+        base="${json_path%.json}"
+        if [[ -d "$base" ]]; then
+            has_kubric=1
+            break
+        fi
+    done
+    if [[ ! -f "$scene_dir/models.json" \
+       && ! -f "$scene_dir/cameras/camera_extrinsics.json" \
+       && $has_kubric -eq 0 ]]; then
+        echo "[multi] $scene_name: no models.json, cameras/camera_extrinsics.json, or Kubric <name>.json+<name>/ pair, skipping"
         continue
     fi
     out_dir="$OUTPUT_ROOT/$scene_name"
