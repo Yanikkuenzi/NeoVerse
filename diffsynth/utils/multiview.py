@@ -47,6 +47,8 @@ def discover_cameras(base_path: Path) -> list[str]:
     - ``models.json`` -> camera names from the ``name`` field.
     - ``cameras/camera_extrinsics.json`` -> folder names whose
       ``_folder_to_json_cam(...)`` matches a key in the JSON.
+    - Kubric per-camera JSON -> folder names with a sibling
+      ``<folder>.json`` file (e.g. ``camera_0000/`` + ``camera_0000.json``).
     """
     base_path = Path(base_path)
     models_path = base_path / "models.json"
@@ -74,9 +76,18 @@ def discover_cameras(base_path: Path) -> list[str]:
                 cams.append(entry.name)
         return cams
 
+    kubric_cams = [
+        entry.name
+        for entry in sorted(base_path.iterdir())
+        if entry.is_dir() and (base_path / f"{entry.name}.json").exists()
+    ]
+    if kubric_cams:
+        return kubric_cams
+
     raise FileNotFoundError(
-        f"Neither {models_path} nor {extrinsics_path} exists; cannot "
-        f"discover cameras for scene at {base_path}."
+        f"None of {models_path}, {extrinsics_path}, or per-camera "
+        f"'<folder>.json' files exist; cannot discover cameras for scene "
+        f"at {base_path}."
     )
 
 
@@ -135,10 +146,88 @@ def load_scene_c2w(
             out[cam] = torch.from_numpy(mats)
         return out
 
+    if all((base_path / f"{cam}.json").exists() for cam in camera_folders):
+        return _load_kubric_scene_c2w(base_path, camera_folders, num_frames)
+
     raise FileNotFoundError(
-        f"Neither {models_path} nor {extrinsics_path} exists; cannot load "
-        f"camera poses for scene at {base_path}."
+        f"None of {models_path}, {extrinsics_path}, or per-camera "
+        f"'<folder>.json' files exist; cannot load camera poses for scene "
+        f"at {base_path}."
     )
+
+
+def _load_kubric_scene_c2w(
+    base_path: Path,
+    camera_folders: list[str],
+    num_frames: int,
+) -> dict[str, Tensor]:
+    """Load per-frame OpenCV c2w from Kubric-style per-camera JSON files.
+
+    Each ``<cam>.json`` stores ``camera.positions`` and ``camera.quaternions``
+    (wxyz) in Blender convention (+X right, +Y up, +Z backward). We convert
+    to OpenCV (+X right, +Y down, +Z forward) by right-multiplying c2w with
+    diag(1, -1, -1, 1), which flips only the camera-local Y and Z axes.
+    """
+    # Blender camera -> OpenCV camera: flip local Y and Z axes.
+    blender_to_opencv = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
+
+    out: dict[str, Tensor] = {}
+    for cam in camera_folders:
+        json_path = base_path / f"{cam}.json"
+        with open(json_path) as f:
+            data = json.load(f)
+
+        cam_data = data["camera"]
+        positions = np.asarray(cam_data["positions"], dtype=np.float32)  # [N, 3]
+        quaternions = np.asarray(cam_data["quaternions"], dtype=np.float32)  # [N, 4], wxyz
+
+        if positions.shape != (len(positions), 3) or quaternions.shape != (len(quaternions), 4):
+            raise ValueError(
+                f"{json_path}: expected positions [N,3] and quaternions [N,4], "
+                f"got {positions.shape} and {quaternions.shape}"
+            )
+        if len(positions) != len(quaternions):
+            raise ValueError(
+                f"{json_path}: positions ({len(positions)}) and quaternions "
+                f"({len(quaternions)}) must have the same length"
+            )
+
+        if len(positions) == 1 and num_frames != 1:
+            positions = np.broadcast_to(positions, (num_frames, 3)).copy()
+            quaternions = np.broadcast_to(quaternions, (num_frames, 4)).copy()
+        elif len(positions) != num_frames:
+            raise ValueError(
+                f"{json_path}: got {len(positions)} camera poses but scene has "
+                f"{num_frames} image frames; counts must match (or supply 1 pose "
+                f"for a static camera)."
+            )
+
+        norms = np.linalg.norm(quaternions, axis=1)
+        if not np.allclose(norms, 1.0, atol=1e-4):
+            raise ValueError(
+                f"{json_path}: quaternions are not unit-norm "
+                f"(min={norms.min():.4f}, max={norms.max():.4f})"
+            )
+
+        mats = np.empty((num_frames, 4, 4), dtype=np.float32)
+        for i in range(num_frames):
+            R = _quat_wxyz_to_rotmat(quaternions[i])
+            c2w_blender = np.eye(4, dtype=np.float32)
+            c2w_blender[:3, :3] = R
+            c2w_blender[:3, 3] = positions[i]
+            mats[i] = c2w_blender @ blender_to_opencv
+        out[cam] = torch.from_numpy(mats)
+    return out
+
+
+def _quat_wxyz_to_rotmat(q: np.ndarray) -> np.ndarray:
+    """Convert a wxyz quaternion to a 3x3 rotation matrix (float32)."""
+    w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z),     2 * (x * z + w * y)],
+        [2 * (x * y + w * z),     1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y)],
+    ], dtype=np.float32)
 
 
 def get_camera_extrinsics(base_path: Path, camera_name: str) -> tuple[Tensor, Tensor]:
