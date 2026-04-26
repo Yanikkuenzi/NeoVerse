@@ -188,13 +188,18 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                     activation="rotation+none", # use 'none' to disable confidence prediction
                 )
 
-    def forward(self, views: Dict[str, torch.Tensor], cond_flags: List[int]=[0, 0, 0], is_inference=True, use_motion=True):
+    def forward(self, views: Dict[str, torch.Tensor], cond_flags: List[int]=[0, 0, 0], is_inference=True, use_motion=True, motion_frame_stride: int = 1):
         """
         Execute forward pass through the WorldMirror model.
 
         Args:
             views: Input data dictionary
             cond_flags: Conditioning flags [depth, rays, camera]
+            motion_frame_stride: Distance (in batch positions) between frames
+                paired in the motion branch and the velocity / dynamic-GS heads.
+                Default 1 means consecutive frames; set to num_cameras when the
+                input is time-major interleaved across multiple cameras so that
+                pairs are same-camera, next-timestamp.
 
         Returns:
             dict: Prediction results dictionary
@@ -203,22 +208,26 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
 
         # Enable conditional input during training if enabled, or during inference if any cond_flags are set
         use_cond = sum(cond_flags) > 0
-        if (imgs.shape[1] == 1):
+        if imgs.shape[1] <= motion_frame_stride:
             use_motion = False
 
         # Extract priors and process features based on conditional input
         if use_cond:
             priors = self.extract_priors(views)
             token_list, patch_start_idx, fwd_token_list, bwd_token_list = self.visual_geometry_transformer(
-                imgs, priors, cond_flags=cond_flags, use_motion=(use_motion and is_inference)
+                imgs, priors, cond_flags=cond_flags, use_motion=(use_motion and is_inference),
+                motion_frame_stride=motion_frame_stride,
             )
         else:
-            token_list, patch_start_idx, fwd_token_list, bwd_token_list = self.visual_geometry_transformer(imgs, use_motion=(use_motion and is_inference))
+            token_list, patch_start_idx, fwd_token_list, bwd_token_list = self.visual_geometry_transformer(
+                imgs, use_motion=(use_motion and is_inference),
+                motion_frame_stride=motion_frame_stride,
+            )
 
         # Generate all predictions
         preds = self._gen_all_preds(
             token_list, imgs, patch_start_idx, views, cond_flags, is_inference, use_motion,
-            fwd_token_list, bwd_token_list
+            fwd_token_list, bwd_token_list, motion_frame_stride=motion_frame_stride,
         )
 
         for key, value in preds.items():
@@ -232,9 +241,11 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
 
     def _gen_all_preds(self, token_list, imgs, patch_start_idx,
                         views, cond_flags, is_inference, use_motion,
-                       fwd_token_list=[], bwd_token_list=[]):
+                       fwd_token_list=[], bwd_token_list=[],
+                       motion_frame_stride: int = 1):
         """Generate all enabled predictions"""
         preds = {}
+        stride = motion_frame_stride
 
         # Camera pose prediction
         if self.enable_cam:
@@ -283,12 +294,12 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             assert len(fwd_token_list) > 0 and len(bwd_token_list) > 0
             vel_fwd, vel_fwd_conf = self.velocity_fwd_head(
                 fwd_token_list,
-                images=context_preds.get("imgs", imgs)[:, :-1],
+                images=context_preds.get("imgs", imgs)[:, :-stride],
                 patch_start_idx=patch_start_idx
             )
             vel_bwd, vel_bwd_conf = self.velocity_bwd_head(
                 bwd_token_list,
-                images=context_preds.get("imgs", imgs)[:, 1:],
+                images=context_preds.get("imgs", imgs)[:, stride:],
                 patch_start_idx=patch_start_idx
             )
             preds["velocity_fwd"] = vel_fwd
@@ -311,12 +322,12 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 assert len(fwd_token_list) > 0 and len(bwd_token_list) > 0
                 gs_fwd_attr, _ = self.gs_fwd_attr_head(
                     fwd_token_list,
-                    images=context_preds.get("imgs", imgs)[:, :-1],
+                    images=context_preds.get("imgs", imgs)[:, :-stride],
                     patch_start_idx=patch_start_idx
                 )
                 gs_bwd_attr, _ = self.gs_bwd_attr_head(
                     bwd_token_list,
-                    images=context_preds.get("imgs", imgs)[:, 1:],
+                    images=context_preds.get("imgs", imgs)[:, stride:],
                     patch_start_idx=patch_start_idx
                 )
                 preds["gs_fwd_attr"] = gs_fwd_attr
@@ -328,7 +339,8 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 predictions=preds,
                 views=views,
                 context_predictions=context_preds,
-                is_inference=is_inference
+                is_inference=is_inference,
+                motion_frame_stride=stride,
             )
         return preds
 

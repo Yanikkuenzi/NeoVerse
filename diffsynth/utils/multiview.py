@@ -1,11 +1,13 @@
 import json
 import re
+import warnings
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch import Tensor
 from scipy.spatial.transform import Rotation
+from evo.core.geometry import GeometryException
 
 from diffsynth.auxiliary_models.worldmirror.models.models.rasterization import Gaussians
 from diffsynth.auxiliary_models.worldmirror.models.utils.rotation import quat_to_rotmat, rotmat_to_quat
@@ -305,7 +307,20 @@ def estimate_sim3_local_to_gt(
     pred_w2c_np = homo_matrix_inverse(pred_c2w).detach().cpu().double().numpy()
     gt_w2c_np = homo_matrix_inverse(gt_c2w).detach().cpu().double().numpy()
 
-    R_np, t_np, s_np = align_poses_umeyama(gt_w2c_np, pred_w2c_np)
+    try:
+        R_np, t_np, s_np = align_poses_umeyama(gt_w2c_np, pred_w2c_np)
+    except GeometryException:
+        warnings.warn(
+            "estimate_sim3_local_to_gt: Umeyama covariance is rank-deficient "
+            "(likely a static camera over this window). Falling back to "
+            "single-pose alignment with s=1; cross-camera scale may be "
+            "inconsistent.",
+            RuntimeWarning,
+        )
+        gt0 = gt_c2w[0].detach().cpu().double().numpy()
+        R_np = gt0[:3, :3]
+        t_np = gt0[:3, 3]
+        s_np = 1.0
 
     device, dtype = pred_c2w.device, pred_c2w.dtype
     R = torch.from_numpy(np.ascontiguousarray(R_np)).to(device=device, dtype=dtype)

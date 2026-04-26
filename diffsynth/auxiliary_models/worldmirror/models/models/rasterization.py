@@ -487,6 +487,7 @@ class GaussianSplatRenderer(nn.Module):
         views: Dict[str, torch.Tensor],
         context_predictions: Dict[str, torch.Tensor],
         is_inference: bool=True,
+        motion_frame_stride: int = 1,
     ) -> Dict[str, torch.Tensor]:
         """
         Returns predictions with the following fields filled:
@@ -541,11 +542,11 @@ class GaussianSplatRenderer(nn.Module):
 
         # 3) Generate splats from gs_params + predictions, and perform voxel merging
         if self.training:
-            splats = self.prepare_splats(views, predictions, images, gs_params, S, position_from="gsdepth+gtcamera")
+            splats = self.prepare_splats(views, predictions, images, gs_params, S, position_from="gsdepth+gtcamera", motion_frame_stride=motion_frame_stride)
         elif not is_inference:
-            splats = self.prepare_splats(views, predictions, images, gs_params, S, context_predictions, position_from="gsdepth+predcamera")
+            splats = self.prepare_splats(views, predictions, images, gs_params, S, context_predictions, position_from="gsdepth+predcamera", motion_frame_stride=motion_frame_stride)
         else:
-            splats = self.prepare_splats(views, predictions, images, gs_params, S, position_from="gsdepth+predcamera")
+            splats = self.prepare_splats(views, predictions, images, gs_params, S, position_from="gsdepth+predcamera", motion_frame_stride=motion_frame_stride)
 
         predictions["splats"] = splats
         predictions["rendered_extrinsics"] = render_viewmats
@@ -636,7 +637,8 @@ class GaussianSplatRenderer(nn.Module):
         return merged
 
     def prepare_splats(self, views, predictions, images, gs_params, context_nums,
-                       context_predictions={}, position_from="gsdepth+gtcamera"):
+                       context_predictions={}, position_from="gsdepth+gtcamera",
+                       motion_frame_stride: int = 1):
         """
         Prepare Gaussian splats from model predictions and input data.
 
@@ -706,27 +708,30 @@ class GaussianSplatRenderer(nn.Module):
         splats["conf"] = conf.reshape(B, S, H * W)
 
         splats["timestamp"] = views["timestamp"][:, :S]
+        stride = motion_frame_stride
         if "velocity_fwd" in predictions:
             camera2world = pose4x4.reshape(B, S, 4, 4)
             world_velocity_fwd = torch.einsum(
-                "bsij, bshwj -> bshwi", camera2world[:, :S-1, :3, :3], predictions["velocity_fwd"]
+                "bsij, bshwj -> bshwi", camera2world[:, :S-stride, :3, :3], predictions["velocity_fwd"]
             )
-            splats["world_velocity_fwd"] = world_velocity_fwd.reshape(B, S-1, H * W, 3)
+            splats["world_velocity_fwd"] = world_velocity_fwd.reshape(B, S-stride, H * W, 3)
 
             world_velocity_bwd = torch.einsum(
-                "bsij, bshwj -> bshwi", camera2world[:, 1:, :3, :3], predictions["velocity_bwd"]
+                "bsij, bshwj -> bshwi", camera2world[:, stride:, :3, :3], predictions["velocity_bwd"]
             )
-            splats["world_velocity_bwd"] = world_velocity_bwd.reshape(B, S-1, H * W, 3)
+            splats["world_velocity_bwd"] = world_velocity_bwd.reshape(B, S-stride, H * W, 3)
 
-            context_vel_mag_fwd = torch.cat([world_velocity_fwd.norm(dim=-1), torch.zeros_like(world_velocity_fwd[:, :1, ..., 0])], dim=1)
-            context_vel_mag_bwd = torch.cat([torch.zeros_like(world_velocity_bwd[:, :1, ..., 0]), world_velocity_bwd.norm(dim=-1)], dim=1)
+            fwd_pad = torch.zeros_like(world_velocity_fwd[:, :stride, ..., 0])
+            bwd_pad = torch.zeros_like(world_velocity_bwd[:, :stride, ..., 0])
+            context_vel_mag_fwd = torch.cat([world_velocity_fwd.norm(dim=-1), fwd_pad], dim=1)
+            context_vel_mag_bwd = torch.cat([bwd_pad, world_velocity_bwd.norm(dim=-1)], dim=1)
             context_vel_mag = torch.max(context_vel_mag_fwd, context_vel_mag_bwd)
         else:
             context_vel_mag = None
 
         if "gs_fwd_attr" in predictions:
-            splats["angular_velocity_fwd"] = predictions["gs_fwd_attr"].reshape(B, S-1, H * W, -1)
-            splats["angular_velocity_bwd"] = predictions["gs_bwd_attr"].reshape(B, S-1, H * W, -1)
+            splats["angular_velocity_fwd"] = predictions["gs_fwd_attr"].reshape(B, S-stride, H * W, -1)
+            splats["angular_velocity_bwd"] = predictions["gs_bwd_attr"].reshape(B, S-stride, H * W, -1)
 
         gaussians = self.separate_splats(
             splats,
@@ -735,6 +740,7 @@ class GaussianSplatRenderer(nn.Module):
             context_depth=depth.reshape(B, S, H, W),
             context_vel_mag=context_vel_mag,
             static_flag=views["is_static"][:, 0],
+            motion_frame_stride=stride,
         )
         return gaussians
 
@@ -743,7 +749,7 @@ class GaussianSplatRenderer(nn.Module):
         Ks = views["camera_intrs"][:, :nums]
         return viewmats, Ks
 
-    def separate_splats(self, splats, context_extrs=None, context_intrs=None, context_depth=None, context_vel_mag=None, static_flag=None):
+    def separate_splats(self, splats, context_extrs=None, context_intrs=None, context_depth=None, context_vel_mag=None, static_flag=None, motion_frame_stride: int = 1):
         B = splats["means"].shape[0]
         gaussian_list = []
         for b in range(B):
@@ -763,7 +769,7 @@ class GaussianSplatRenderer(nn.Module):
             )
 
             # Compute attributes for dynamic gaussians
-            dynamic_gaussians = self._create_dynamic_gaussians(splats, b, dynamic_indices)
+            dynamic_gaussians = self._create_dynamic_gaussians(splats, b, dynamic_indices, motion_frame_stride=motion_frame_stride)
 
             # Combine constant gaussians with dynamic/static gaussians
             final_gaussian_list = dynamic_gaussians
@@ -801,8 +807,9 @@ class GaussianSplatRenderer(nn.Module):
         )
         return gaussians
 
-    def _create_dynamic_gaussians(self, splats, batch_idx, dynamic_indices):
+    def _create_dynamic_gaussians(self, splats, batch_idx, dynamic_indices, motion_frame_stride: int = 1):
         S, N, _ = splats["means"][batch_idx].shape
+        stride = motion_frame_stride
 
         # Create dynamic mask matrix for more efficient indexing
         dynamic_mask_all = torch.zeros((S, N), dtype=torch.bool, device=splats["means"].device)
@@ -814,6 +821,8 @@ class GaussianSplatRenderer(nn.Module):
         for s in range(S):
             dynamic_mask = dynamic_mask_all[s]
             if dynamic_mask.any():
+                has_fwd = s < (S - stride)
+                has_bwd = s >= stride
                 gs = Gaussians(
                     means=splats["means"][batch_idx, s][dynamic_mask],
                     harmonics=splats["sh"][batch_idx, s][dynamic_mask],
@@ -824,12 +833,12 @@ class GaussianSplatRenderer(nn.Module):
                     timestamp=splats["timestamp"][batch_idx, s].item(),
                     life_span=splats["weights"][batch_idx, s][dynamic_mask],
                     life_span_gamma=self.life_span_gamma,
-                    forward_timestamp=splats["timestamp"][batch_idx, s + 1].item() if s < (S - 1) else None,
-                    forward_vel=splats["world_velocity_fwd"][batch_idx, s][dynamic_mask] if "world_velocity_fwd" in splats and s < (S - 1) else None,
-                    forward_rotations=splats["angular_velocity_fwd"][batch_idx, s][dynamic_mask] if "angular_velocity_fwd" in splats and s < (S - 1) else None,
-                    backward_timestamp=splats["timestamp"][batch_idx, s - 1].item() if s > 0 else None,
-                    backward_vel=splats["world_velocity_bwd"][batch_idx, s - 1][dynamic_mask] if "world_velocity_bwd" in splats and s > 0 else None,
-                    backward_rotations=splats["angular_velocity_bwd"][batch_idx, s - 1][dynamic_mask] if "angular_velocity_bwd" in splats and s > 0 else None,
+                    forward_timestamp=splats["timestamp"][batch_idx, s + stride].item() if has_fwd else None,
+                    forward_vel=splats["world_velocity_fwd"][batch_idx, s][dynamic_mask] if "world_velocity_fwd" in splats and has_fwd else None,
+                    forward_rotations=splats["angular_velocity_fwd"][batch_idx, s][dynamic_mask] if "angular_velocity_fwd" in splats and has_fwd else None,
+                    backward_timestamp=splats["timestamp"][batch_idx, s - stride].item() if has_bwd else None,
+                    backward_vel=splats["world_velocity_bwd"][batch_idx, s - stride][dynamic_mask] if "world_velocity_bwd" in splats and has_bwd else None,
+                    backward_rotations=splats["angular_velocity_bwd"][batch_idx, s - stride][dynamic_mask] if "angular_velocity_bwd" in splats and has_bwd else None,
                 )
                 gaussian_list.append(gs)
         return gaussian_list

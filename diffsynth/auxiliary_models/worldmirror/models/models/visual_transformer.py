@@ -307,7 +307,7 @@ class VisualGeometryTransformer(nn.Module):
         nn.init.normal_(self.cam_token, std=1e-6)
         nn.init.normal_(self.reg_token, std=1e-6)
 
-    def forward(self, images: torch.Tensor, priors: List | None=None, cond_flags: List[int]=[0,0,0], ctx_frames: int=None, use_motion: bool=False) -> Tuple[List[torch.Tensor], int]:
+    def forward(self, images: torch.Tensor, priors: List | None=None, cond_flags: List[int]=[0,0,0], ctx_frames: int=None, use_motion: bool=False, motion_frame_stride: int=1) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images: Input images with shape [B, S, 3, H, W], in range [0, 1]
@@ -315,6 +315,10 @@ class VisualGeometryTransformer(nn.Module):
             cond_flags: List indicating which conditions to use [pose, depth, rays]
             ctx_frames: Number of context frames to use
             use_motion: Whether to predict motion
+            motion_frame_stride: Distance between frames paired in the motion
+                branch (default 1 = consecutive frames). When the input is
+                interleaved [(t,c) for t for c], set this to num_cameras so each
+                pair is the same camera at the next timestamp.
 
         Returns:
             (list[torch.Tensor], int): List of attention block outputs and patch_start_idx
@@ -400,15 +404,16 @@ class VisualGeometryTransformer(nn.Module):
                     outputs.append(combined_out)
 
             fwd_output_list, bwd_output_list = [], []
-            if self.enable_motion and use_motion:
+            if self.enable_motion and use_motion and motion_frame_stride < seq_len:
+                stride = motion_frame_stride
                 if pos_emb.shape != (b, seq_len, patch_count, 2):
                     pos_emb = pos_emb.reshape(b, seq_len, patch_count, 2)
                 for idx in range(len(outputs)):
                     tokens = outputs[idx]
                     tokens = self.motion_embeds[idx](tokens)
-                    tokens1 = tokens[:, :-1] + self.motion_tokens[:, :1]
-                    tokens2 = tokens[:, 1:] + self.motion_tokens[:, 1:]
-                    pos_emb1, pos_emb2 = pos_emb[:, :-1], pos_emb[:, 1:]
+                    tokens1 = tokens[:, :-stride] + self.motion_tokens[:, :1]
+                    tokens2 = tokens[:, stride:] + self.motion_tokens[:, 1:]
+                    pos_emb1, pos_emb2 = pos_emb[:, :-stride], pos_emb[:, stride:]
                     fwd_output, bwd_output = self._process_motion_branch(
                         tokens1, tokens2, pos_emb1, pos_emb2, idx
                     )
