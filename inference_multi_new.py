@@ -1,8 +1,10 @@
 """Interleaved-multi-camera NVS rendering for NeoVerse.
 
-For every non-overlapping 5-frame window with center ``i``, we feed all four
-cameras at the four context timestamps ``[i-2, i-1, i+1, i+2]`` to the
-reconstructor in time-major interleaved order:
+The sliding 5-frame window advances by 1 frame, so every target index ``i`` in
+``[2, n-3]`` (where ``n`` is the number of frames common to all cameras) is
+rendered. For each center ``i``, we feed all four cameras at the four context
+timestamps ``[i-2, i-1, i+1, i+2]`` to the reconstructor in time-major
+interleaved order:
 
     [(t_{i-2}, c0), (t_{i-2}, c1), (t_{i-2}, c2), (t_{i-2}, c3),
      (t_{i-1}, c0), ..., (t_{i+2}, c3)]                       -> 16 context views
@@ -196,7 +198,7 @@ def render_scene(
     centers = list(range(
         TARGET_INDEX_IN_WINDOW,
         num_frames - (FRAMES_PER_WINDOW - TARGET_INDEX_IN_WINDOW - 1),
-        FRAMES_PER_WINDOW,
+        1,
     ))
     if max_windows is not None:
         centers = centers[:max_windows]
