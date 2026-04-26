@@ -1,4 +1,4 @@
-"""Interleaved-multi-camera NVS evaluation for NeoVerse.
+"""Interleaved-multi-camera NVS rendering for NeoVerse.
 
 For every non-overlapping 5-frame window with center ``i``, we feed all four
 cameras at the four context timestamps ``[i-2, i-1, i+1, i+2]`` to the
@@ -8,13 +8,20 @@ reconstructor in time-major interleaved order:
      (t_{i-1}, c0), ..., (t_{i+2}, c3)]                       -> 16 context views
 
 The motion branch pairs same-camera consecutive timestamps via
-``motion_frame_stride = num_cameras = 4`` (`--no_skip_frames_in_motion_branch`
+``motion_frame_stride = num_cameras = 4`` (``--no_skip_frames_in_motion_branch``
 disables this for ablation). The held-out timestamp ``t_i`` is rendered for
 each of the 4 cameras using each camera's predicted pose at the t_{i-1}
-batch slot. Per-camera and overall PSNR / SSIM / LPIPS are reported.
+batch slot. Rendered frames are written to disk as PNGs; metrics are
+computed by a separate downstream script that diffs the output tree against
+the GT scene tree.
 
 The script never invokes the diffusion stack; only ``pipe.reconstructor`` and
 ``pipe.reconstructor.gs_renderer.rasterizer`` run.
+
+Output layout (matches the inference_multiview.py convention so a metrics
+script can map output -> GT by identical filename):
+
+    <output_path>/<take_name>/<cam>/<original_frame_filename>
 
 Example:
 
@@ -22,6 +29,7 @@ Example:
         --scenes_txt /path/to/scenes.txt \
         --scenes_root /path/to/scenes_root \
         --output_path outputs/multi_new_eval/exp_a \
+        --cameras camera_0000 camera_0001 camera_0002 camera_0003 \
         --reconstructor_path models/NeoVerse/reconstructor.ckpt \
         --height 336 --width 560 --resize_mode center_crop
 """
@@ -29,9 +37,6 @@ Example:
 from __future__ import annotations
 
 import argparse
-import csv
-import json
-import os
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -43,10 +48,12 @@ from torchvision.transforms import functional as F
 
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth.utils.auxiliary import center_crop, homo_matrix_inverse
-from diffsynth.utils.metrics import compute_lpips, compute_psnr, compute_ssim
 from diffsynth.utils.multiview import load_frames_from_dir
 
 
+NUM_CAMERAS = 4
+FRAMES_PER_WINDOW = 5
+TARGET_INDEX_IN_WINDOW = 2  # the held-out middle frame
 _IMG_EXTS = {".png", ".jpg", ".jpeg"}
 
 
@@ -68,12 +75,6 @@ def discover_camera_dirs(scene_path: Path) -> List[str]:
     return cams
 
 
-NUM_CAMERAS = 4
-FRAMES_PER_WINDOW = 5
-TARGET_INDEX_IN_WINDOW = 2  # the held-out middle frame
-CTX_LOCAL_INDICES = (0, 1, 3, 4)  # frame offsets within a 5-frame window used as context
-
-
 def _load_and_resize(path: str, width: int, height: int, resize_mode: str) -> Image.Image:
     img = Image.open(path).convert("RGB")
     if resize_mode == "resize":
@@ -85,15 +86,69 @@ def _to_tensor(img: Image.Image) -> torch.Tensor:
     return F.to_tensor(img)  # [3, H, W] in [0, 1]
 
 
-def _save_comparison(rendered: torch.Tensor, gt: torch.Tensor, path: Path) -> None:
-    rend_np = rendered.permute(1, 2, 0).clamp(0, 1).cpu().numpy()
-    gt_np = gt.permute(1, 2, 0).clamp(0, 1).cpu().numpy()
-    side = np.concatenate([rend_np, gt_np], axis=1)
-    Image.fromarray((side * 255).clip(0, 255).astype(np.uint8)).save(path)
+def _save_rendered(rendered_chw: torch.Tensor, path: Path) -> None:
+    arr = (rendered_chw.clamp(0, 1) * 255).byte().permute(1, 2, 0).cpu().numpy()
+    Image.fromarray(arr).save(path)
+
+
+def _resolve_cameras_for_scene(
+    scene_path: Path, requested: Optional[List[str]]
+) -> Optional[List[str]]:
+    """Return the camera-folder names to use for ``scene_path``.
+
+    If ``requested`` is given, use it verbatim and verify all folders exist.
+    Otherwise auto-discover and take the first ``NUM_CAMERAS``. Returns None
+    if the scene can't satisfy ``NUM_CAMERAS``.
+    """
+    if requested is not None:
+        missing = [c for c in requested if not (scene_path / c).is_dir()]
+        if missing:
+            print(f"  [SKIP] Missing camera folder(s): {missing}")
+            return None
+        return list(requested)
+
+    discovered = discover_camera_dirs(scene_path)
+    if len(discovered) < NUM_CAMERAS:
+        print(f"  [SKIP] Only {len(discovered)} cameras discovered, need {NUM_CAMERAS}")
+        return None
+    return discovered[:NUM_CAMERAS]
+
+
+def _intersect_frames(
+    cameras: List[str],
+    frames_by_cam_paths: Dict[str, List[str]],
+) -> List[Dict[str, str]]:
+    """Compute the per-frame intersection (by basename) across cameras.
+
+    Returns a list of dicts ``{cam: full_path}`` in sorted-filename order.
+    Prints a warning per camera that contributed extra (dropped) frames.
+    """
+    name_to_path: Dict[str, Dict[str, str]] = {}
+    cam_basenames: Dict[str, set] = {}
+    for cam in cameras:
+        cam_basenames[cam] = set()
+        for full in frames_by_cam_paths[cam]:
+            name = Path(full).name
+            cam_basenames[cam].add(name)
+            name_to_path.setdefault(name, {})[cam] = full
+
+    common = sorted(set.intersection(*(cam_basenames[c] for c in cameras)))
+
+    for cam in cameras:
+        extra = sorted(cam_basenames[cam] - set(common))
+        if extra:
+            preview = ", ".join(extra[:10])
+            more = f" ... (+{len(extra) - 10} more)" if len(extra) > 10 else ""
+            print(
+                f"  [WARN] Camera '{cam}' has {len(extra)} frame(s) missing from "
+                f"other cameras; dropping: [{preview}{more}]"
+            )
+
+    return [{cam: name_to_path[name][cam] for cam in cameras} for name in common]
 
 
 @torch.no_grad()
-def eval_scene(
+def render_scene(
     pipe,
     scene_path: Path,
     output_dir: Path,
@@ -102,63 +157,77 @@ def eval_scene(
     resize_mode: str,
     motion_frame_stride: int,
     max_windows: Optional[int],
-    save_comparison_images: bool,
-    max_saved_images: int,
-) -> Optional[Dict]:
+    cameras_arg: Optional[List[str]],
+) -> bool:
     take_name = scene_path.name
     print(f"\n=== Scene {take_name} ===")
 
-    cameras = discover_camera_dirs(scene_path)
-    if len(cameras) < NUM_CAMERAS:
-        print(f"  [SKIP] Found only {len(cameras)} cameras, need {NUM_CAMERAS}")
-        return None
-    cameras = cameras[:NUM_CAMERAS]
+    if not scene_path.is_dir():
+        print(f"  [SKIP] Scene directory not found: {scene_path}")
+        return False
+
+    cameras = _resolve_cameras_for_scene(scene_path, cameras_arg)
+    if cameras is None:
+        return False
+    if len(cameras) != NUM_CAMERAS:
+        print(f"  [SKIP] Expected {NUM_CAMERAS} cameras, got {len(cameras)}")
+        return False
     print(f"  Cameras: {cameras}")
 
-    frames_by_cam: Dict[str, List[str]] = {}
+    frames_by_cam_paths: Dict[str, List[str]] = {}
     for cam in cameras:
-        frames_by_cam[cam] = load_frames_from_dir(str(scene_path / cam))
-    num_frames = len(frames_by_cam[cameras[0]])
-    for cam in cameras:
-        if len(frames_by_cam[cam]) != num_frames:
-            raise ValueError(
-                f"Camera {cam} has {len(frames_by_cam[cam])} frames, expected {num_frames}"
-            )
-    print(f"  {num_frames} frames per camera")
+        frames_by_cam_paths[cam] = load_frames_from_dir(str(scene_path / cam))
 
-    # Non-overlapping 5-frame windows: starts 0, 5, 10, ... ; centers 2, 7, 12, ...
-    centers = list(range(TARGET_INDEX_IN_WINDOW, num_frames - (FRAMES_PER_WINDOW - TARGET_INDEX_IN_WINDOW - 1), FRAMES_PER_WINDOW))
+    intersection = _intersect_frames(cameras, frames_by_cam_paths)
+    num_frames = len(intersection)
+    if num_frames < FRAMES_PER_WINDOW:
+        print(
+            f"  [SKIP] Only {num_frames} frame(s) common to all cameras; need "
+            f"≥ {FRAMES_PER_WINDOW}"
+        )
+        return False
+    print(f"  {num_frames} frames common to all cameras")
+
+    # Per-camera ordered path list that is index-aligned with the intersection.
+    frames_by_cam: Dict[str, List[str]] = {
+        cam: [row[cam] for row in intersection] for cam in cameras
+    }
+
+    centers = list(range(
+        TARGET_INDEX_IN_WINDOW,
+        num_frames - (FRAMES_PER_WINDOW - TARGET_INDEX_IN_WINDOW - 1),
+        FRAMES_PER_WINDOW,
+    ))
     if max_windows is not None:
         centers = centers[:max_windows]
     if not centers:
         print("  [SKIP] Not enough frames for a single window")
-        return None
+        return False
+
+    # Output dirs (one per camera under the scene).
+    for cam in cameras:
+        (output_dir / take_name / cam).mkdir(parents=True, exist_ok=True)
 
     device = pipe.device
-
-    per_cam_psnr: Dict[str, List[float]] = {c: [] for c in cameras}
-    per_cam_ssim: Dict[str, List[float]] = {c: [] for c in cameras}
-    per_cam_lpips: Dict[str, List[float]] = {c: [] for c in cameras}
-    per_cam_frame: Dict[str, List[int]] = {c: [] for c in cameras}
-    saved_count = 0
+    rendered_count = 0
 
     for w_idx, center in enumerate(centers):
         window_starts = [center - 2, center - 1, center + 1, center + 2]
         target_t = center
-        # Interleaved time-major ordering: [(t0,c0..c3), (t1,c0..c3), (t3,c0..c3), (t4,c0..c3)]
+
+        # Time-major interleaved ordering: [(t0,c0..c3), (t1,c0..c3), (t3,c0..c3), (t4,c0..c3)]
         ctx_pairs: List[Tuple[int, str]] = []
         for t in window_starts:
             for cam in cameras:
                 ctx_pairs.append((t, cam))
 
-        # Build [1, 16, 3, H, W]
         imgs_list = [
             _to_tensor(_load_and_resize(frames_by_cam[cam][t], width, height, resize_mode))
             for (t, cam) in ctx_pairs
         ]
         ctx_imgs = torch.stack(imgs_list, dim=0).unsqueeze(0).to(device)
 
-        # Timestamps spaced by 2 (matches inference_multiview.py convention)
+        # Timestamps spaced by 2 (matches inference_multiview.py convention).
         timestamps = torch.tensor([2 * t for (t, _) in ctx_pairs], dtype=torch.int64, device=device)
 
         views = {
@@ -187,10 +256,10 @@ def eval_scene(
 
         pred_c2w = predictions["rendered_extrinsics"][0]  # [16, 4, 4]
         pred_K = predictions["rendered_intrinsics"][0]    # [16, 3, 3]
-        splats = predictions["splats"][0]                 # list[len=16] of Gaussians
+        splats = predictions["splats"][0]
 
-        # For target camera c, reuse the predicted pose at the t_{i-1} slot
-        # (batch position 4 + c — the closest pre-target context for that camera).
+        # Reuse each camera's predicted pose at the t_{i-1} slot
+        # (batch position 4 + c — closest pre-target context for that camera).
         slot_t_minus_1 = NUM_CAMERAS * 1  # = 4
         render_c2w = torch.stack(
             [pred_c2w[slot_t_minus_1 + c] for c in range(NUM_CAMERAS)], dim=0
@@ -219,94 +288,26 @@ def eval_scene(
         # rendered_rgb: [1, 4, H, W, 3] in [0, 1]
         rendered = rendered_rgb[0].permute(0, 3, 1, 2)  # [4, 3, H, W]
 
-        # Load GT for the target timestamp per camera
-        gt_imgs_list = [
-            _to_tensor(_load_and_resize(frames_by_cam[cam][target_t], width, height, resize_mode))
-            for cam in cameras
-        ]
-        gt_imgs = torch.stack(gt_imgs_list, dim=0).to(device)  # [4, 3, H, W]
-
-        # Per-camera metrics
-        psnr = compute_psnr(gt_imgs, rendered)
-        ssim = compute_ssim(gt_imgs, rendered)
-        lpips_val = compute_lpips(gt_imgs, rendered)
-
+        # Save under the GT filename for that target frame so a downstream
+        # metrics script can map output -> GT trivially.
         for c_idx, cam in enumerate(cameras):
-            per_cam_psnr[cam].append(psnr[c_idx].item())
-            per_cam_ssim[cam].append(ssim[c_idx].item())
-            per_cam_lpips[cam].append(lpips_val[c_idx].item())
-            per_cam_frame[cam].append(target_t)
+            out_name = Path(frames_by_cam[cam][target_t]).name
+            _save_rendered(rendered[c_idx], output_dir / take_name / cam / out_name)
+            rendered_count += 1
 
-        avg_psnr = float(psnr.mean().item())
         print(
             f"  Window {w_idx + 1}/{len(centers)} center={target_t} "
-            f"enc={encode_time:.2f}s render={render_time:.2f}s "
-            f"PSNR={avg_psnr:.2f}"
+            f"enc={encode_time:.2f}s render={render_time:.2f}s"
         )
-
-        if save_comparison_images and (max_saved_images <= 0 or saved_count < max_saved_images):
-            imgs_dir = output_dir / take_name / "images"
-            imgs_dir.mkdir(parents=True, exist_ok=True)
-            for c_idx, cam in enumerate(cameras):
-                if max_saved_images > 0 and saved_count >= max_saved_images:
-                    break
-                _save_comparison(
-                    rendered[c_idx],
-                    gt_imgs[c_idx],
-                    imgs_dir / f"{cam}_t{target_t:04d}_rendered_vs_gt.png",
-                )
-                saved_count += 1
-
         torch.cuda.empty_cache()
 
-    # Aggregate per camera
-    summary: Dict[str, dict] = {}
-    for cam in cameras:
-        if not per_cam_psnr[cam]:
-            continue
-        summary[cam] = {
-            "avg_psnr": float(np.mean(per_cam_psnr[cam])),
-            "avg_ssim": float(np.mean(per_cam_ssim[cam])),
-            "avg_lpips": float(np.mean(per_cam_lpips[cam])),
-            "num_frames": len(per_cam_psnr[cam]),
-        }
-
-        csv_path = output_dir / f"{take_name}_{cam}_frame_metrics.csv"
-        with open(csv_path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["frame_index", "psnr", "ssim", "lpips"])
-            for fi, p, s, l in zip(
-                per_cam_frame[cam],
-                per_cam_psnr[cam],
-                per_cam_ssim[cam],
-                per_cam_lpips[cam],
-            ):
-                w.writerow([fi, f"{p:.6f}", f"{s:.6f}", f"{l:.6f}"])
-
-    if not summary:
-        print(f"  [WARN] No metrics computed for {take_name}")
-        return None
-
-    overall = {
-        "avg_psnr": float(np.mean([m["avg_psnr"] for m in summary.values()])),
-        "avg_ssim": float(np.mean([m["avg_ssim"] for m in summary.values()])),
-        "avg_lpips": float(np.mean([m["avg_lpips"] for m in summary.values()])),
-    }
-    summary["overall"] = overall
-
-    with open(output_dir / f"{take_name}_eval_summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
-
-    print(
-        f"  [{take_name}] overall PSNR={overall['avg_psnr']:.2f} "
-        f"SSIM={overall['avg_ssim']:.4f} LPIPS={overall['avg_lpips']:.4f}"
-    )
-    return overall
+    print(f"  Saved {rendered_count} rendered frames under {output_dir / take_name}")
+    return True
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Interleaved-multi-camera NVS evaluation for NeoVerse"
+        description="Interleaved-multi-camera NVS rendering for NeoVerse"
     )
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--scenes_txt", type=Path,
@@ -315,8 +316,12 @@ def parse_args():
                      help="Single scene directory.")
     parser.add_argument("--scenes_root", type=Path, default=None,
                         help="Root directory containing scene folders (required with --scenes_txt).")
-    parser.add_argument("--output_path", type=Path, default=Path("outputs/multi_new_eval"),
-                        help="Output directory for metrics + optional comparison images.")
+    parser.add_argument("--output_path", type=Path, default=Path("outputs/multi_new"),
+                        help="Output directory; rendered PNGs land at "
+                             "<output_path>/<take_name>/<cam>/<filename>.")
+    parser.add_argument("--cameras", nargs="*", default=None,
+                        help=f"Camera folder names to use (must be exactly "
+                             f"{NUM_CAMERAS}). If omitted, auto-discover per scene.")
     parser.add_argument("--model_path", default="models",
                         help="Local model directory.")
     parser.add_argument("--reconstructor_path",
@@ -330,10 +335,6 @@ def parse_args():
                         help="Cap windows per scene (debug).")
     parser.add_argument("--no_skip_frames_in_motion_branch", action="store_true",
                         help="Use motion_frame_stride=1 (ablation; default uses stride=4).")
-    parser.add_argument("--save_comparison_images", action="store_true",
-                        help="Save side-by-side rendered/GT PNGs.")
-    parser.add_argument("--max_saved_images", type=int, default=0,
-                        help="Cap on saved comparison images per scene (0 = unlimited).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--low_vram", action="store_true")
     return parser.parse_args()
@@ -343,6 +344,12 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+
+    if args.cameras is not None and len(args.cameras) != NUM_CAMERAS:
+        raise ValueError(
+            f"--cameras must list exactly {NUM_CAMERAS} folder names, got {len(args.cameras)}: "
+            f"{args.cameras}"
+        )
 
     if args.scenes_txt is not None:
         if args.scenes_root is None:
@@ -357,6 +364,7 @@ def main():
 
     motion_frame_stride = 1 if args.no_skip_frames_in_motion_branch else NUM_CAMERAS
     print(f"motion_frame_stride = {motion_frame_stride}")
+    print(f"cameras (script-wide) = {args.cameras}")
 
     print(f"Loading model from {args.model_path}...")
     pipe = WanVideoNeoVersePipeline.from_pretrained(
@@ -370,10 +378,10 @@ def main():
     )
     print("Model loaded. Diffusion modules will NOT be invoked.")
 
-    per_scene_overall: Dict[str, Dict] = {}
+    succeeded = 0
     for scene_path, take_name in scenes:
         try:
-            overall = eval_scene(
+            ok = render_scene(
                 pipe=pipe,
                 scene_path=scene_path,
                 output_dir=args.output_path,
@@ -382,34 +390,15 @@ def main():
                 resize_mode=args.resize_mode,
                 motion_frame_stride=motion_frame_stride,
                 max_windows=args.max_windows,
-                save_comparison_images=args.save_comparison_images,
-                max_saved_images=args.max_saved_images,
+                cameras_arg=args.cameras,
             )
-            if overall is not None:
-                per_scene_overall[take_name] = overall
+            if ok:
+                succeeded += 1
         except Exception as e:
             print(f"[WARN] Scene {take_name} failed: {e}")
             continue
 
-    if len(scenes) > 1 and per_scene_overall:
-        agg = {
-            "scenes": per_scene_overall,
-            "macro_avg": {
-                "avg_psnr": float(np.mean([m["avg_psnr"] for m in per_scene_overall.values()])),
-                "avg_ssim": float(np.mean([m["avg_ssim"] for m in per_scene_overall.values()])),
-                "avg_lpips": float(np.mean([m["avg_lpips"] for m in per_scene_overall.values()])),
-                "num_scenes": len(per_scene_overall),
-            },
-        }
-        with open(args.output_path / "aggregate_summary.json", "w") as f:
-            json.dump(agg, f, indent=2)
-        print(
-            f"\n=== Aggregate over {len(per_scene_overall)} scenes ===\n"
-            f"PSNR={agg['macro_avg']['avg_psnr']:.2f} "
-            f"SSIM={agg['macro_avg']['avg_ssim']:.4f} "
-            f"LPIPS={agg['macro_avg']['avg_lpips']:.4f}"
-        )
-
+    print(f"\nFinished: rendered {succeeded}/{len(scenes)} scenes -> {args.output_path}")
     return 0
 
 
