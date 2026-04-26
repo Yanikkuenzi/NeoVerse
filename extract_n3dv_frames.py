@@ -6,10 +6,9 @@ Input layout:
 Output layout (written in-place under each scene):
     <dataset_root>/<scene>/camera_<XXXX>/<NNNNN>.png
 
-Frames are decoded with the ``ffmpeg-python`` package (libx264 -> PNG). Each
-scene's cameras are extracted in parallel via a process pool.
-
-Requires: ``pip install ffmpeg-python`` (and the ffmpeg binary on PATH).
+Frames are decoded with OpenCV (whose pip wheel bundles its own video
+decoder libs — no system ffmpeg needed). Each scene's cameras are
+extracted in parallel via a process pool.
 
 Example:
     python extract_n3dv_frames.py --dataset_root /data/n3dv
@@ -27,7 +26,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-import ffmpeg
+import cv2
 
 CAM_RE = re.compile(r"^cam(\d{2})\.mp4$", re.IGNORECASE)
 
@@ -58,7 +57,7 @@ def extract_one(
     out_dir_str: str,
     frame_pattern: str,
     overwrite: bool,
-    qscale: int,
+    png_compression: int,
 ) -> Tuple[str, int, Optional[str]]:
     """Extract all frames of one video into ``out_dir``. Runs in a worker process."""
     video_path = Path(video_path_str)
@@ -71,26 +70,26 @@ def extract_one(
             return (str(out_dir), 0, "exists (skipped; use --overwrite to redo)")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_template = str(out_dir / frame_pattern)
-    try:
-        (
-            ffmpeg
-            .input(str(video_path))
-            .output(
-                out_template,
-                start_number=0,
-                vsync=0,
-                **{"qscale:v": qscale},
-            )
-            .global_args("-hide_banner", "-loglevel", "error", "-nostdin")
-            .overwrite_output()
-            .run(capture_stdout=True, capture_stderr=True)
-        )
-    except ffmpeg.Error as e:
-        msg = e.stderr.decode("utf-8", errors="replace").strip() if e.stderr else str(e)
-        return (str(out_dir), 0, msg or "ffmpeg failed")
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return (str(out_dir), 0, f"cv2.VideoCapture failed to open {video_path}")
 
-    n = sum(1 for p in out_dir.iterdir() if p.suffix.lower() == ".png")
+    write_params = [cv2.IMWRITE_PNG_COMPRESSION, int(png_compression)]
+    n = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            out_path = str(out_dir / (frame_pattern % n))
+            if not cv2.imwrite(out_path, frame, write_params):
+                return (str(out_dir), n, f"cv2.imwrite failed at frame {n}: {out_path}")
+            n += 1
+    finally:
+        cap.release()
+
+    if n == 0:
+        return (str(out_dir), 0, "decoded 0 frames (codec not supported by this OpenCV build?)")
     return (str(out_dir), n, None)
 
 
@@ -105,9 +104,9 @@ def main() -> int:
     ap.add_argument("--overwrite", action="store_true",
                     help="Wipe existing camera_XXXX/ output dirs before extracting.")
     ap.add_argument("--frame_pattern", default="%05d.png",
-                    help="ffmpeg output pattern relative to camera_XXXX/ (default '%%05d.png').")
-    ap.add_argument("--qscale", type=int, default=2,
-                    help="ffmpeg PNG qscale:v (lower=better; default 2).")
+                    help="Per-frame filename %% pattern relative to camera_XXXX/ (default '%%05d.png').")
+    ap.add_argument("--png_compression", type=int, default=3,
+                    help="cv2 PNG compression 0..9 (higher=smaller/slower; default 3).")
     args = ap.parse_args()
 
     if not args.dataset_root.is_dir():
@@ -140,7 +139,7 @@ def main() -> int:
         futs = {
             pool.submit(
                 extract_one,
-                vid, out, args.frame_pattern, args.overwrite, args.qscale,
+                vid, out, args.frame_pattern, args.overwrite, args.png_compression,
             ): (vid, out)
             for (vid, out) in jobs
         }
