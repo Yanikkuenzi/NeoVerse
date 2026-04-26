@@ -98,22 +98,48 @@ def _resolve_cameras_for_scene(
 ) -> Optional[List[str]]:
     """Return the camera-folder names to use for ``scene_path``.
 
-    If ``requested`` is given, use it verbatim and verify all folders exist.
-    Otherwise auto-discover and take the first ``NUM_CAMERAS``. Returns None
-    if the scene can't satisfy ``NUM_CAMERAS``.
-    """
-    if requested is not None:
-        missing = [c for c in requested if not (scene_path / c).is_dir()]
-        if missing:
-            print(f"  [SKIP] Missing camera folder(s): {missing}")
-            return None
-        return list(requested)
+    If ``requested`` is given, keep each requested camera that has frames; for
+    each missing-or-empty one, substitute the next available (non-empty) camera
+    in sorted order that isn't already in the chosen set. If the scene can't
+    fill ``NUM_CAMERAS`` slots even after substitution, returns None.
 
-    discovered = discover_camera_dirs(scene_path)
-    if len(discovered) < NUM_CAMERAS:
-        print(f"  [SKIP] Only {len(discovered)} cameras discovered, need {NUM_CAMERAS}")
-        return None
-    return discovered[:NUM_CAMERAS]
+    If ``requested`` is None, auto-discover non-empty cameras and take the first
+    ``NUM_CAMERAS``.
+    """
+    available = discover_camera_dirs(scene_path)  # already filters out empty dirs
+
+    if requested is None:
+        if len(available) < NUM_CAMERAS:
+            print(f"  [SKIP] Only {len(available)} non-empty cameras, need {NUM_CAMERAS}")
+            return None
+        return available[:NUM_CAMERAS]
+
+    available_set = set(available)
+    chosen: List[str] = []
+    substitutions: List[Tuple[str, str]] = []
+    fallback_pool = [c for c in available if c not in requested]
+    fallback_iter = iter(fallback_pool)
+
+    for cam in requested:
+        if cam in available_set:
+            chosen.append(cam)
+            continue
+        replacement = next(
+            (c for c in fallback_iter if c not in chosen),
+            None,
+        )
+        if replacement is None:
+            print(
+                f"  [SKIP] '{cam}' is missing/empty and no available camera "
+                f"left to substitute (available={available})"
+            )
+            return None
+        chosen.append(replacement)
+        substitutions.append((cam, replacement))
+
+    for orig, sub in substitutions:
+        print(f"  [INFO] '{orig}' missing/empty -> substituting '{sub}'")
+    return chosen
 
 
 def _intersect_frames(
@@ -212,10 +238,25 @@ def render_scene(
 
     device = pipe.device
     rendered_count = 0
+    skipped_existing = 0
 
     for w_idx, center in enumerate(centers):
         window_starts = [center - 2, center - 1, center + 1, center + 2]
         target_t = center
+
+        # Resume support: if all 4 target PNGs for this window already exist on
+        # disk, skip the reconstruction+render entirely.
+        out_paths = [
+            output_dir / take_name / cam / Path(frames_by_cam[cam][target_t]).name
+            for cam in cameras
+        ]
+        if all(p.exists() for p in out_paths):
+            skipped_existing += 1
+            print(
+                f"  Window {w_idx + 1}/{len(centers)} center={target_t} "
+                f"[SKIP] outputs already exist"
+            )
+            continue
 
         # Time-major interleaved ordering: [(t0,c0..c3), (t1,c0..c3), (t3,c0..c3), (t4,c0..c3)]
         ctx_pairs: List[Tuple[int, str]] = []
@@ -292,9 +333,8 @@ def render_scene(
 
         # Save under the GT filename for that target frame so a downstream
         # metrics script can map output -> GT trivially.
-        for c_idx, cam in enumerate(cameras):
-            out_name = Path(frames_by_cam[cam][target_t]).name
-            _save_rendered(rendered[c_idx], output_dir / take_name / cam / out_name)
+        for c_idx, out_path in enumerate(out_paths):
+            _save_rendered(rendered[c_idx], out_path)
             rendered_count += 1
 
         print(
@@ -303,7 +343,11 @@ def render_scene(
         )
         torch.cuda.empty_cache()
 
-    print(f"  Saved {rendered_count} rendered frames under {output_dir / take_name}")
+    print(
+        f"  Saved {rendered_count} rendered frames "
+        f"({skipped_existing} window(s) skipped as already rendered) under "
+        f"{output_dir / take_name}"
+    )
     return True
 
 
