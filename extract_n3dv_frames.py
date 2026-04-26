@@ -6,8 +6,10 @@ Input layout:
 Output layout (written in-place under each scene):
     <dataset_root>/<scene>/camera_<XXXX>/<NNNNN>.png
 
-Frames are decoded with ffmpeg (libx264 -> PNG). Each scene's cameras are
-extracted in parallel via a process pool.
+Frames are decoded with the ``ffmpeg-python`` package (libx264 -> PNG). Each
+scene's cameras are extracted in parallel via a process pool.
+
+Requires: ``pip install ffmpeg-python`` (and the ffmpeg binary on PATH).
 
 Example:
     python extract_n3dv_frames.py --dataset_root /data/n3dv
@@ -20,11 +22,12 @@ from __future__ import annotations
 import argparse
 import re
 import shutil
-import subprocess
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+import ffmpeg
 
 CAM_RE = re.compile(r"^cam(\d{2})\.mp4$", re.IGNORECASE)
 
@@ -69,22 +72,23 @@ def extract_one(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     out_template = str(out_dir / frame_pattern)
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-nostdin",
-        "-y",
-        "-i", str(video_path),
-        "-start_number", "0",
-        "-vsync", "0",
-        "-qscale:v", str(qscale),
-        out_template,
-    ]
     try:
-        subprocess.run(cmd, check=True, capture_output=True)
-    except subprocess.CalledProcessError as e:
-        return (str(out_dir), 0, e.stderr.decode("utf-8", errors="replace").strip() or "ffmpeg failed")
+        (
+            ffmpeg
+            .input(str(video_path))
+            .output(
+                out_template,
+                start_number=0,
+                vsync=0,
+                **{"qscale:v": qscale},
+            )
+            .global_args("-hide_banner", "-loglevel", "error", "-nostdin")
+            .overwrite_output()
+            .run(capture_stdout=True, capture_stderr=True)
+        )
+    except ffmpeg.Error as e:
+        msg = e.stderr.decode("utf-8", errors="replace").strip() if e.stderr else str(e)
+        return (str(out_dir), 0, msg or "ffmpeg failed")
 
     n = sum(1 for p in out_dir.iterdir() if p.suffix.lower() == ".png")
     return (str(out_dir), n, None)
