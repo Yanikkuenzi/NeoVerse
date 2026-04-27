@@ -33,6 +33,7 @@ from typing import List, Optional, Tuple
 
 import cv2
 import h5py
+import numpy as np
 
 
 def read_scenes_file(scenes_file: Path) -> List[str]:
@@ -98,9 +99,14 @@ def extract_one(
     with h5py.File(h5_path_str, "r") as hf:
         frames_ds = hf["frames"]
         num_frames = int(frames_ds.shape[0])
+        is_float = np.issubdtype(frames_ds.dtype, np.floating)
         for t in range(num_frames):
-            rgb = frames_ds[t, cam_idx]
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            rgb = np.asarray(frames_ds[t, cam_idx])
+            if is_float:
+                rgb = np.clip(rgb.astype(np.float32) * 255.0, 0, 255).astype(np.uint8)
+            elif rgb.dtype != np.uint8:
+                rgb = rgb.astype(np.uint8)
+            bgr = rgb[..., ::-1]
             out_path = str(out_dir / (frame_pattern % t))
             if not cv2.imwrite(out_path, bgr, write_params):
                 return (str(out_dir), n, f"cv2.imwrite failed at frame {t}: {out_path}")
