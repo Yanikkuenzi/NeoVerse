@@ -52,14 +52,15 @@ def scene_h5_path(h5_root: Path, scene: str) -> Path:
 
 
 def discover_jobs(
-    h5_root: Path, scenes: List[str], out_root: Path,
-) -> Tuple[List[Tuple[str, int, str, str]], List[str]]:
-    """Return (jobs, missing_scenes).
+    h5_root: Path, scenes: List[str], out_root: Path, overwrite: bool,
+) -> Tuple[List[Tuple[str, int, str, str]], List[str], List[str]]:
+    """Return (jobs, missing_scenes, skipped_scenes).
 
     Each job is (h5_path, cam_idx, cam_label, out_dir).
     """
     jobs: List[Tuple[str, int, str, str]] = []
     missing: List[str] = []
+    skipped: List[str] = []
     for scene in scenes:
         h5_path = scene_h5_path(h5_root, scene)
         if not h5_path.is_file():
@@ -67,12 +68,19 @@ def discover_jobs(
             continue
         with h5py.File(h5_path, "r") as hf:
             num_cameras = int(hf["frames"].shape[1])
+        scene_out = out_root / scene
+        if not overwrite and scene_out.is_dir():
+            expected = [scene_out / f"camera_{i + 1:04d}" for i in range(num_cameras)]
+            if all(p.is_dir() and any(p.iterdir()) for p in expected):
+                print(f"[SKIP] {scene}: already extracted ({num_cameras} cameras)")
+                skipped.append(scene)
+                continue
         print(f"[{scene}] {num_cameras} cameras")
         for cam_idx in range(num_cameras):
             cam_label = f"camera_{cam_idx + 1:04d}"
-            out_dir = out_root / scene / cam_label
+            out_dir = scene_out / cam_label
             jobs.append((str(h5_path), cam_idx, cam_label, str(out_dir)))
-    return jobs, missing
+    return jobs, missing, skipped
 
 
 def extract_one(
@@ -149,11 +157,11 @@ def main() -> int:
         print(f"[ERROR] No scenes listed in {args.scenes_file}", file=sys.stderr)
         return 2
 
-    jobs, missing = discover_jobs(args.h5_root, scenes, args.out_root)
+    jobs, missing, skipped = discover_jobs(args.h5_root, scenes, args.out_root, args.overwrite)
     for scene in missing:
         print(f"[WARN] Missing h5 for scene '{scene}' (expected {scene_h5_path(args.h5_root, scene)}); skipping.")
 
-    if not jobs:
+    if not jobs and not skipped:
         print("[ERROR] No (scene, camera) jobs to run.", file=sys.stderr)
         return 2
 
@@ -187,7 +195,8 @@ def main() -> int:
                 print(f"  [OK]   {scene_dir}/{cam_label}  ({n} frames)")
 
     print(f"\nDone. {len(jobs) - failures}/{len(jobs)} jobs extracted; "
-          f"{failures} failure(s); {len(missing)} scene(s) missing.")
+          f"{failures} failure(s); {len(missing)} scene(s) missing; "
+          f"{len(skipped)} scene(s) already-done.")
     return 0 if (failures == 0 and not missing) else 1
 
 
