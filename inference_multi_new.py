@@ -56,6 +56,7 @@ from diffsynth.utils.multiview import load_frames_from_dir
 NUM_CAMERAS = 4
 FRAMES_PER_WINDOW = 5
 TARGET_INDEX_IN_WINDOW = 2  # the held-out middle frame
+MAX_FRAMES_PER_CAMERA = 400
 _IMG_EXTS = {".png", ".jpg", ".jpeg"}
 
 
@@ -226,8 +227,6 @@ def render_scene(
         num_frames - (FRAMES_PER_WINDOW - TARGET_INDEX_IN_WINDOW - 1),
         1,
     ))
-    if max_windows is not None:
-        centers = centers[:max_windows]
     if not centers:
         print("  [SKIP] Not enough frames for a single window")
         return False
@@ -236,27 +235,36 @@ def render_scene(
     for cam in cameras:
         (output_dir / take_name / cam).mkdir(parents=True, exist_ok=True)
 
+    def _window_done(center: int) -> bool:
+        return all(
+            (output_dir / take_name / cam / Path(frames_by_cam[cam][center]).name).exists()
+            for cam in cameras
+        )
+
+    todo: List[int] = []
+    skipped_existing = 0
+    for c in centers:
+        if _window_done(c):
+            skipped_existing += 1
+        else:
+            todo.append(c)
+
+    # Each window emits one frame per camera; cap to-render windows directly.
+    centers = todo[:MAX_FRAMES_PER_CAMERA]
+    if max_windows is not None:
+        centers = centers[:max_windows]
+
     device = pipe.device
     rendered_count = 0
-    skipped_existing = 0
 
     for w_idx, center in enumerate(centers):
         window_starts = [center - 2, center - 1, center + 1, center + 2]
         target_t = center
 
-        # Resume support: if all 4 target PNGs for this window already exist on
-        # disk, skip the reconstruction+render entirely.
         out_paths = [
             output_dir / take_name / cam / Path(frames_by_cam[cam][target_t]).name
             for cam in cameras
         ]
-        if all(p.exists() for p in out_paths):
-            skipped_existing += 1
-            print(
-                f"  Window {w_idx + 1}/{len(centers)} center={target_t} "
-                f"[SKIP] outputs already exist"
-            )
-            continue
 
         # Time-major interleaved ordering: [(t0,c0..c3), (t1,c0..c3), (t3,c0..c3), (t4,c0..c3)]
         ctx_pairs: List[Tuple[int, str]] = []
