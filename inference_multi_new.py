@@ -10,9 +10,9 @@ interleaved order:
      (t_{i-1}, c0), ..., (t_{i+2}, c3)]                       -> 16 context views
 
 The motion branch pairs same-camera consecutive timestamps via
-``motion_frame_stride = num_cameras = 4`` (``--no_skip_frames_in_motion_branch``
+``motion_frame_stride = num_cameras`` (``--no_skip_frames_in_motion_branch``
 disables this for ablation). The held-out timestamp ``t_i`` is rendered for
-each of the 4 cameras using each camera's predicted pose at the t_{i-1}
+each camera using each camera's predicted pose at the t_{i-1}
 batch slot. Rendered frames are written to disk as PNGs; metrics are
 computed by a separate downstream script that diffs the output tree against
 the GT scene tree.
@@ -53,7 +53,6 @@ from diffsynth.utils.auxiliary import center_crop, homo_matrix_inverse
 from diffsynth.utils.multiview import load_frames_from_dir
 
 
-NUM_CAMERAS = 4
 FRAMES_PER_WINDOW = 5
 TARGET_INDEX_IN_WINDOW = 2  # the held-out middle frame
 MAX_FRAMES_PER_CAMERA = 400
@@ -95,25 +94,25 @@ def _save_rendered(rendered_chw: torch.Tensor, path: Path) -> None:
 
 
 def _resolve_cameras_for_scene(
-    scene_path: Path, requested: Optional[List[str]]
+    scene_path: Path, requested: Optional[List[str]], num_cameras: int
 ) -> Optional[List[str]]:
     """Return the camera-folder names to use for ``scene_path``.
 
     If ``requested`` is given, keep each requested camera that has frames; for
     each missing-or-empty one, substitute the next available (non-empty) camera
     in sorted order that isn't already in the chosen set. If the scene can't
-    fill ``NUM_CAMERAS`` slots even after substitution, returns None.
+    fill ``num_cameras`` slots even after substitution, returns None.
 
     If ``requested`` is None, auto-discover non-empty cameras and take the first
-    ``NUM_CAMERAS``.
+    ``num_cameras``.
     """
     available = discover_camera_dirs(scene_path)  # already filters out empty dirs
 
     if requested is None:
-        if len(available) < NUM_CAMERAS:
-            print(f"  [SKIP] Only {len(available)} non-empty cameras, need {NUM_CAMERAS}")
+        if len(available) < num_cameras:
+            print(f"  [SKIP] Only {len(available)} non-empty cameras, need {num_cameras}")
             return None
-        return available[:NUM_CAMERAS]
+        return available[:num_cameras]
 
     available_set = set(available)
     chosen: List[str] = []
@@ -187,6 +186,7 @@ def render_scene(
     motion_frame_stride: int,
     max_windows: Optional[int],
     cameras_arg: Optional[List[str]],
+    num_cameras: int,
 ) -> bool:
     take_name = scene_path.name
     print(f"\n=== Scene {take_name} ===")
@@ -195,11 +195,11 @@ def render_scene(
         print(f"  [SKIP] Scene directory not found: {scene_path}")
         return False
 
-    cameras = _resolve_cameras_for_scene(scene_path, cameras_arg)
+    cameras = _resolve_cameras_for_scene(scene_path, cameras_arg, num_cameras)
     if cameras is None:
         return False
-    if len(cameras) != NUM_CAMERAS:
-        print(f"  [SKIP] Expected {NUM_CAMERAS} cameras, got {len(cameras)}")
+    if len(cameras) != num_cameras:
+        print(f"  [SKIP] Expected {num_cameras} cameras, got {len(cameras)}")
         return False
     print(f"  Cameras: {cameras}")
 
@@ -310,18 +310,18 @@ def render_scene(
         splats = predictions["splats"][0]
 
         # Reuse each camera's predicted pose at the t_{i-1} slot
-        # (batch position 4 + c — closest pre-target context for that camera).
-        slot_t_minus_1 = NUM_CAMERAS * 1  # = 4
+        # (closest pre-target context for that camera).
+        slot_t_minus_1 = num_cameras
         render_c2w = torch.stack(
-            [pred_c2w[slot_t_minus_1 + c] for c in range(NUM_CAMERAS)], dim=0
+            [pred_c2w[slot_t_minus_1 + c] for c in range(num_cameras)], dim=0
         )
         render_K = torch.stack(
-            [pred_K[slot_t_minus_1 + c] for c in range(NUM_CAMERAS)], dim=0
+            [pred_K[slot_t_minus_1 + c] for c in range(num_cameras)], dim=0
         )
         render_w2c = homo_matrix_inverse(render_c2w)
 
         render_timestamps = torch.full(
-            (NUM_CAMERAS,), 2 * target_t, dtype=torch.int64, device=device
+            (num_cameras,), 2 * target_t, dtype=torch.int64, device=device
         )
 
         t0 = time.time()
@@ -374,8 +374,12 @@ def parse_args():
                         help="Output directory; rendered PNGs land at "
                              "<output_path>/<take_name>/<cam>/<filename>.")
     parser.add_argument("--cameras", nargs="*", default=None,
-                        help=f"Camera folder names to use (must be exactly "
-                             f"{NUM_CAMERAS}). If omitted, auto-discover per scene.")
+                        help="Camera folder names to use. If omitted, "
+                             "auto-discover per scene using --num_cameras.")
+    parser.add_argument("--num_cameras", type=int, default=4,
+                        help="Number of cameras to use when --cameras is "
+                             "omitted (auto-discovery). Ignored when "
+                             "--cameras is given.")
     parser.add_argument("--model_path", default="models",
                         help="Local model directory.")
     parser.add_argument("--reconstructor_path",
@@ -388,7 +392,7 @@ def parse_args():
     parser.add_argument("--max_windows", type=int, default=None,
                         help="Cap windows per scene (debug).")
     parser.add_argument("--no_skip_frames_in_motion_branch", action="store_true",
-                        help="Use motion_frame_stride=1 (ablation; default uses stride=4).")
+                        help="Use motion_frame_stride=1 (ablation; default uses stride=num_cameras).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--low_vram", action="store_true")
     return parser.parse_args()
@@ -399,11 +403,9 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    if args.cameras is not None and len(args.cameras) != NUM_CAMERAS:
-        raise ValueError(
-            f"--cameras must list exactly {NUM_CAMERAS} folder names, got {len(args.cameras)}: "
-            f"{args.cameras}"
-        )
+    num_cameras = len(args.cameras) if args.cameras is not None else args.num_cameras
+    if num_cameras < 1:
+        raise ValueError(f"num_cameras must be >= 1, got {num_cameras}")
 
     if args.scenes_txt is not None:
         if args.scenes_root is None:
@@ -416,7 +418,8 @@ def main():
 
     args.output_path.mkdir(parents=True, exist_ok=True)
 
-    motion_frame_stride = 1 if args.no_skip_frames_in_motion_branch else NUM_CAMERAS
+    motion_frame_stride = 1 if args.no_skip_frames_in_motion_branch else num_cameras
+    print(f"num_cameras = {num_cameras}")
     print(f"motion_frame_stride = {motion_frame_stride}")
     print(f"cameras (script-wide) = {args.cameras}")
 
@@ -445,6 +448,7 @@ def main():
                 motion_frame_stride=motion_frame_stride,
                 max_windows=args.max_windows,
                 cameras_arg=args.cameras,
+                num_cameras=num_cameras,
             )
             if ok:
                 succeeded += 1
