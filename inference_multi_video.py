@@ -48,7 +48,7 @@ from diffsynth.utils.multiview import load_frames_from_dir
 
 NUM_CAMERAS = 4
 FRAMES_PER_BATCH = 4
-BATCHES_PER_SCENE = 100
+BATCHES_PER_SCENE = 200
 _IMG_EXTS = {".png", ".jpg", ".jpeg"}
 
 
@@ -417,7 +417,7 @@ def main():
         reconstructor_path=args.reconstructor_path,
         lora_path=None,
         lora_alpha=1.0,
-        device="cuda",
+        device="cuda:1",
         torch_dtype=torch.bfloat16,
         enable_vram_management=args.low_vram,
     )

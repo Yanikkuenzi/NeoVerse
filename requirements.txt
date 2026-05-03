@@ -11,7 +11,7 @@ sentencepiece
 imageio
 imageio[ffmpeg]
 opencv-python
-decord
+#decord
 
 # Model downloading
 huggingface_hub
@@ -27,15 +27,15 @@ addict
 moviepy==1.0.3
 
 # Demo
-gradio
-trimesh
+#gradio
+#trimesh
 
 # Training
-accelerate
-deepspeed==0.16.7
-omegaconf
-peft
-tensorboard
+#accelerate
+#deepspeed==0.16.7
+#omegaconf
+#peft
+#tensorboard
 
 # Text processing
 ftfy
